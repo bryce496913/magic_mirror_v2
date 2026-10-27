@@ -13,6 +13,17 @@ def test_environment_overrides():
     )
 
 
+def test_dashboard_configuration():
+    settings = Settings.from_env({
+        "MIRROR_CLOCK_FORMAT": "12", "MIRROR_DISPLAY_SCALE": "1.25",
+        "MIRROR_MODULES": "weather,assistant",
+    })
+    assert settings.clock_format == "12"
+    assert settings.display_scale == 1.25
+    assert settings.enabled_modules == ("weather", "assistant")
+    assert Settings.from_env({"MIRROR_MODULES": ""}).enabled_modules == ()
+
+
 @pytest.mark.parametrize(
     "values",
     [
@@ -22,6 +33,11 @@ def test_environment_overrides():
         {"MIRROR_PORT": "0"},
         {"MIRROR_PORT": "65536"},
         {"MIRROR_LOG_LEVEL": "VERBOSE"},
+        {"MIRROR_CLOCK_FORMAT": "13"},
+        {"MIRROR_DISPLAY_SCALE": "nan"},
+        {"MIRROR_DISPLAY_SCALE": "0.5"},
+        {"MIRROR_MODULES": "weather,weather"},
+        {"MIRROR_MODULES": "weather,unknown"},
     ],
 )
 def test_invalid_configuration(values):

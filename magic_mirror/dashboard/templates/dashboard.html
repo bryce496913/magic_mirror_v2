@@ -1,15 +1,67 @@
 <!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Magic Mirror V2</title>
-    <style>
-      body { margin: 0; min-height: 100vh; display: grid; place-items: center;
-             background: #101820; color: #f5f7fa; font: 1.5rem system-ui, sans-serif; }
-      main { text-align: center; }
-      p { color: #a8d8b9; }
-    </style>
-  </head>
-  <body><main><h1>Magic Mirror V2</h1><p>Application status: {{ status }}</p></main></body>
+<html lang="en" style="--display-scale: {{ settings.display_scale }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#000000">
+  <title>Magic Mirror V2</title>
+  <link rel="stylesheet" href="{{ url_for('dashboard.static', filename='dashboard.css') }}">
+  <script defer src="{{ url_for('dashboard.static', filename='clock.js') }}"></script>
+  <script defer src="{{ url_for('dashboard.static', filename='modules.js') }}"></script>
+</head>
+<body>
+<main class="mirror" aria-label="Magic Mirror V2 dashboard">
+  <header class="clock-region" data-clock-format="{{ settings.clock_format }}">
+    <p class="eyebrow">Magic Mirror V2</p>
+    <time id="clock-time" class="clock-time" aria-label="Local time">--:--</time>
+    <p id="clock-date" class="clock-date">Loading local date</p>
+  </header>
+
+  {% if 'weather' in settings.enabled_modules %}
+  <section class="weather-region module" id="module-weather" data-module="weather" aria-labelledby="weather-title">
+    <h2 id="weather-title">Weather</h2>
+    <p class="module-status" data-role="status">Not connected</p>
+    <p class="module-detail" data-role="detail">Current conditions and forecast will appear here.</p>
+  </section>
+  {% endif %}
+
+  <div class="left-column">
+    {% if 'news' in settings.enabled_modules %}
+    <section class="module" id="module-news" data-module="news" aria-labelledby="news-title">
+      <h2 id="news-title">News</h2>
+      <p class="module-status" data-role="status">Not connected</p>
+      <p class="module-detail" data-role="detail">Headlines will appear here.</p>
+    </section>
+    {% endif %}
+  </div>
+
+  <div class="right-column">
+    {% if 'pihole' in settings.enabled_modules %}
+    <section class="module" id="module-pihole" data-module="pihole" aria-labelledby="pihole-title">
+      <h2 id="pihole-title">Pi-hole</h2>
+      <p class="module-status" data-role="status">Not connected</p>
+      <p class="module-detail" data-role="detail">Status will appear here.</p>
+    </section>
+    {% endif %}
+    {% if 'system' in settings.enabled_modules %}
+    <section class="module" id="module-system" data-module="system" aria-labelledby="system-title">
+      <h2 id="system-title">Raspberry Pi</h2>
+      <p class="module-status" data-role="status">Not connected</p>
+      <p class="module-detail" data-role="detail">System information will appear here.</p>
+    </section>
+    {% endif %}
+  </div>
+
+  <footer class="bottom-region">
+    {% if 'assistant' in settings.enabled_modules %}
+    <section class="assistant module" id="module-assistant" data-module="assistant" data-state="unavailable" aria-labelledby="assistant-title">
+      <h2 id="assistant-title">Assistant</h2>
+      <p class="module-status" data-role="status">Unavailable</p>
+      <p class="module-detail" data-role="detail">Conversation will appear here.</p>
+    </section>
+    {% endif %}
+    <p class="app-status">Application status: Running</p>
+  </footer>
+</main>
+</body>
 </html>
