@@ -39,7 +39,8 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        data.stop()
+        if not data.stop():
+            logger.warning("Dashboard data workers still finishing bounded requests at process exit")
         logger.info("Magic Mirror V2 stopped")
     return 0
 
