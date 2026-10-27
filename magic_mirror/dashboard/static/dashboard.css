@@ -36,6 +36,8 @@ p, h2 { margin: 0; }
 .module-status { margin-top: 0.5rem; font-size: clamp(1.3rem, 2.4vw, 2.2rem); line-height: 1.2; }
 .module-detail { margin-top: 0.4rem; color: #939393; font-size: clamp(0.95rem, 1.5vw, 1.3rem); line-height: 1.35; }
 .module-status, .module-detail { overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.news-items { color: #d4d4d4; font-size: clamp(0.85rem, 1.3vw, 1.1rem); }
+.news-items p { margin-top: 0.45rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .assistant { text-align: center; }
 .assistant .module-status { font-size: clamp(1.2rem, 2vw, 1.8rem); }
 .assistant .module-detail { max-width: 60rem; margin-inline: auto; }

@@ -15,4 +15,5 @@ data/private/
 *.pem
 *.key
 credentials.json
+pihole-password
 .DS_Store

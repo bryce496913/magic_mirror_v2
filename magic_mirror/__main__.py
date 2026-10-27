@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 from .app import create_app
 from .config import ConfigurationError, Settings, configure_logging
+from .data import DashboardData
 
 
 def main() -> int:
@@ -21,7 +22,8 @@ def main() -> int:
 
     configure_logging(settings.log_level)
     logger = logging.getLogger("magic_mirror")
-    app = create_app(settings)
+    data = DashboardData(settings)
+    app = create_app(settings, data)
     # Werkzeug handles Ctrl+C itself; make a manual SIGTERM follow the same path.
     def stop_server(_signum, _frame):
         raise KeyboardInterrupt
@@ -29,6 +31,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop_server)
     logger.info("Starting Magic Mirror V2 on %s:%s", settings.host, settings.port)
     try:
+        data.start()
         app.run(host=settings.host, port=settings.port, debug=False, use_reloader=False)
     except OSError as exc:
         logger.error("Unable to start server: %s", exc)
@@ -36,6 +39,7 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        data.stop()
         logger.info("Magic Mirror V2 stopped")
     return 0
 

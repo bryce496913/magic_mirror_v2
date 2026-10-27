@@ -18,7 +18,7 @@ def test_dashboard_regions_and_local_assets():
     assert b'id="clock-date"' in response.data
     assert b"Not connected" in response.data
     assert b"Conversation will appear here" in response.data
-    for asset in ("dashboard.css", "clock.js", "modules.js"):
+    for asset in ("dashboard.css", "clock.js", "modules.js", "data.js"):
         assert app.test_client().get(f"/dashboard-assets/{asset}").status_code == 200
 
 
