@@ -8,6 +8,19 @@
     return typeof value === "number" && Number.isFinite(value) ? value + (suffix || "") : "—";
   }
 
+  function formatTemperature(value, unit) {
+    return typeof value === "number" && Number.isFinite(value) ?
+      String(Number(value.toFixed(0))) + "°" + unit : "—";
+  }
+
+  if (typeof module !== "undefined" && module.exports) module.exports = {formatTemperature};
+  if (typeof document === "undefined") return;
+
+  function setWeatherReading(region, name, data) {
+    region.querySelector('[data-role="' + name + '-c"]').textContent = formatTemperature(data[name + "_c"], "C");
+    region.querySelector('[data-role="' + name + '-f"]').textContent = formatTemperature(data[name + "_f"], "F");
+  }
+
   function uptime(seconds) {
     if (typeof seconds !== "number") return "—";
     const days = Math.floor(seconds / 86400);
@@ -19,6 +32,11 @@
     const data = snapshot && snapshot.data;
     const stale = snapshot && snapshot.status === "stale";
     if (!data || snapshot.status === "unavailable") {
+      if (name === "weather") {
+        const region = document.getElementById("module-weather");
+        region.querySelector('[data-role="weather-current"]').hidden = true;
+        region.querySelector('[data-role="weather-metrics"]').hidden = true;
+      }
       const list = document.querySelector("#module-news [data-role=headlines]");
       if (name === "news" && list) list.replaceChildren();
       window.MirrorDashboard.setModule(name, {
@@ -31,8 +49,15 @@
       status = "CPU " + number(data.cpu_percent, "%") + " · " + number(data.cpu_temperature_c, "°C");
       detail = "RAM " + number(data.ram_used_gb) + "/" + number(data.ram_total_gb, " GB") + " (" + number(data.ram_percent, "%") + ") · Disk " + number(data.disk_percent, "%") + " · Up " + uptime(data.uptime_seconds);
     } else if (name === "weather") {
-      status = (data.icon || "") + " " + number(data.temperature, data.unit) + " · " + (data.description || "Conditions unavailable");
-      detail = "High " + number(data.high, data.unit) + " / Low " + number(data.low, data.unit) + " · Tomorrow: " + (data.forecast || "Unavailable");
+      const region = document.getElementById("module-weather");
+      ["temperature", "high", "low", "feels_like"].forEach(function (field) {
+        setWeatherReading(region, field, data);
+      });
+      region.querySelector('[data-role="weather-current"]').hidden = false;
+      region.querySelector('[data-role="weather-metrics"]').hidden = false;
+      region.querySelector('[data-role="feels-row"]').hidden = data.feels_like_c == null || data.feels_like_f == null;
+      status = (data.icon || "") + " " + (data.description || "Conditions unavailable");
+      detail = "Tomorrow: " + (data.forecast || "Unavailable");
     } else if (name === "pihole") {
       status = data.blocking_enabled ? "Blocking enabled" : "Blocking disabled";
       detail = number(data.queries_total) + " queries · " + number(data.queries_blocked) + " blocked (" + number(data.blocked_percent, "%") + ")";

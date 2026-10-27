@@ -69,7 +69,7 @@ The expected response is `{"status":"healthy"}`. Stop the foreground server with
 | `MIRROR_DISPLAY_SCALE` | `1.0` | Optional text scaling, from `0.75` to `1.5`. |
 | `MIRROR_MODULES` | `weather,news,pihole,system,assistant` | Comma-separated regions to show; empty hides all optional regions. |
 | `MIRROR_WEATHER_LATITUDE`, `MIRROR_WEATHER_LONGITUDE` | blank | Set both coordinates to enable Open-Meteo. No physical location is assumed. |
-| `MIRROR_WEATHER_UNIT` | `celsius` | `celsius` or `fahrenheit`. |
+| `MIRROR_WEATHER_UNIT` | `celsius` | `celsius` or `fahrenheit` for the Open-Meteo response and existing JSON fields. The display always puts °C first and °F second. |
 | `MIRROR_NEWS_FEEDS` | blank | Up to five comma-separated HTTPS or HTTP RSS/Atom URLs. |
 | `MIRROR_PIHOLE_URL` | `http://127.0.0.1` | Pi-hole v6 API base address on the same Pi. |
 | `MIRROR_PIHOLE_PASSWORD_FILE` | blank | Optional absolute path to a local Pi-hole v6 application password file. |
@@ -82,7 +82,7 @@ The clock uses the Pi's configured local timezone through Chromium. Change the P
 
 On shutdown, all workers receive a stop signal and no new refresh starts. The application waits up to seven seconds in total for active work. If a bounded network call lasts longer, the coordinator reports that workers are still alive and retains their handles; another `stop()` can wait again, and `start()` refuses to create replacements until those workers finish. When the foreground Flask process exits, any remaining daemon worker ends with that process. This does not alter Pi-hole or other services.
 
-Open-Meteo supplies current temperature, condition, high/low, and tomorrow's short forecast. RSS/Atom feeds supply at most three deduplicated titles with publisher and publication time when available. News text is inserted as text, and article scripts or images are never loaded. The Pi-hole provider implements the v6 `/api/stats/summary`, `/api/dns/blocking`, and session authentication contract documented by Pi-hole; it only reads statistics and blocking status after authentication. The system provider reads psutil and Linux thermal data without privilege. CPU temperature shows an unavailable marker if no sensor is present.
+Open-Meteo supplies current temperature, condition, high/low, feels-like when available, and tomorrow's short forecast. Each weather reading shows Celsius in larger white type followed by Fahrenheit in smaller gray type. Both values are calculated from the same response; no second API request is made. Existing JSON fields (`temperature`, `high`, `low`, `feels_like`, and `unit`) keep their configured source units; additional `_c` and `_f` fields supply the dual display. RSS/Atom feeds supply at most three deduplicated titles with publisher and publication time when available. News text is inserted as text, and article scripts or images are never loaded. The Pi-hole provider implements the v6 `/api/stats/summary`, `/api/dns/blocking`, and session authentication contract documented by Pi-hole; it only reads statistics and blocking status after authentication. The system provider reads psutil and Linux thermal data without privilege. CPU temperature shows an unavailable marker if no sensor is present.
 
 For the hardware validation steps, including a private Pi-hole credential setup procedure and version check, see [Pass 3 Raspberry Pi validation](docs/PASS3_PI_VALIDATION.md).
 

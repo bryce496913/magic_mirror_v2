@@ -24,6 +24,16 @@ def _number(value):
     return round(value, 1)
 
 
+def dual_temperature(value, unit):
+    """Return Celsius and Fahrenheit from one Open-Meteo reading."""
+    if value is None:
+        return None, None
+    value = _number(value)
+    if unit == "fahrenheit":
+        return round((value - 32) * 5 / 9, 1), value
+    return value, round(value * 9 / 5 + 32, 1)
+
+
 def read_weather(settings):
     if settings.weather_latitude is None:
         raise ProviderUnavailable("Location not configured")
@@ -50,6 +60,8 @@ def read_weather(settings):
         }
         feels_like = current.get("apparent_temperature")
         result["feels_like"] = _number(feels_like) if feels_like is not None else None
+        for field in ("temperature", "high", "low", "feels_like"):
+            result[field + "_c"], result[field + "_f"] = dual_temperature(result[field], settings.weather_unit)
         chance = daily.get("precipitation_probability_max", [None])[0]
         result["precipitation_percent"] = _number(chance) if chance is not None else None
         return result

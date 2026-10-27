@@ -7,6 +7,7 @@
   font-synthesis: none;
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 .mirror {
   width: 100%; height: 100vh; height: 100dvh;
@@ -36,6 +37,14 @@ p, h2 { margin: 0; }
 .module-status { margin-top: 0.5rem; font-size: clamp(1.3rem, 2.4vw, 2.2rem); line-height: 1.2; }
 .module-detail { margin-top: 0.4rem; color: #939393; font-size: clamp(0.95rem, 1.5vw, 1.3rem); line-height: 1.35; }
 .module-status, .module-detail { overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.weather-current { display: flex; justify-content: flex-end; align-items: baseline; gap: 0.35rem; white-space: nowrap; line-height: 1.05; margin-top: 0.35rem; }
+.weather-primary { color: #fff; font-size: clamp(2.4rem, 4.5vw, 4.5rem); font-weight: 400; font-variant-numeric: tabular-nums; }
+.weather-secondary, .weather-divider { color: #939393; font-size: clamp(1.15rem, 1.8vw, 1.6rem); }
+.weather-metrics { margin-top: 0.45rem; }
+.weather-metrics p { display: flex; justify-content: flex-end; align-items: baseline; gap: 0.35rem; margin-top: 0.15rem; white-space: nowrap; }
+.metric-label { color: #aaa; margin-right: 0.25rem; font-size: clamp(0.9rem, 1.2vw, 1.1rem); }
+.metric-primary { color: #fff; font-size: clamp(1.1rem, 1.5vw, 1.4rem); font-variant-numeric: tabular-nums; }
+.metric-secondary, .metric-divider { color: #939393; font-size: clamp(0.9rem, 1.15vw, 1.05rem); font-variant-numeric: tabular-nums; }
 .news-items { color: #d4d4d4; font-size: clamp(0.85rem, 1.3vw, 1.1rem); }
 .news-items p { margin-top: 0.45rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .assistant { text-align: center; }
@@ -60,4 +69,7 @@ p, h2 { margin: 0; }
   .right-column { gap: 0.7rem; }
   .module-status, .module-detail { margin-top: 0.15rem; }
   .bottom-region { gap: 0.25rem; }
+  .weather-primary { font-size: 2.4rem; }
+  .weather-metrics { margin-top: 0.2rem; }
+  .weather-metrics p { margin-top: 0; }
 }

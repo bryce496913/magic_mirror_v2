@@ -11,7 +11,7 @@ from magic_mirror.providers import ProviderUnavailable
 from magic_mirror.providers.news import read_news
 from magic_mirror.providers.pihole import PiHoleProvider
 from magic_mirror.providers.system import read_system
-from magic_mirror.providers.weather import read_weather
+from magic_mirror.providers.weather import dual_temperature, read_weather
 
 
 class Response:
@@ -59,13 +59,52 @@ def test_weather_success_and_invalid_data(monkeypatch):
                "daily": {"temperature_2m_max": [25, 26], "temperature_2m_min": [15, 16],
                          "weather_code": [2, 3], "precipitation_probability_max": [20, 10]}}
     monkeypatch.setattr(weather.requests, "get", lambda *_args, **_kwargs: Response(payload))
-    assert read_weather(settings)["description"] == "Partly cloudy"
+    weather_data = read_weather(settings)
+    assert weather_data["description"] == "Partly cloudy"
+    assert weather_data["temperature"] == 22
+    assert weather_data["unit"] == "°C"
+    assert (weather_data["temperature_c"], weather_data["temperature_f"]) == (22, 71.6)
+    assert (weather_data["high_c"], weather_data["high_f"]) == (25, 77)
+    assert (weather_data["low_c"], weather_data["low_f"]) == (15, 59)
+    assert (weather_data["feels_like_c"], weather_data["feels_like_f"]) == (23, 73.4)
     payload["current"]["temperature_2m"] = "bad"
     with pytest.raises(ProviderUnavailable):
         read_weather(settings)
     monkeypatch.setattr(weather.requests, "get", lambda *_args, **_kwargs: (_ for _ in ()).throw(requests.Timeout()))
     with pytest.raises(requests.Timeout):
         read_weather(settings)
+
+
+@pytest.mark.parametrize("value,unit,expected", [
+    (11, "celsius", (11, 51.8)),
+    (-10, "celsius", (-10, 14)),
+    (-40, "celsius", (-40, -40)),
+    (52, "fahrenheit", (11.1, 52)),
+    (-4, "fahrenheit", (-20, -4)),
+    (None, "celsius", (None, None)),
+])
+def test_dual_temperature_conversion(value, unit, expected):
+    assert dual_temperature(value, unit) == expected
+
+
+def test_fahrenheit_source_retains_original_fields(monkeypatch):
+    from magic_mirror.providers import weather
+    requests_made = []
+    payload = {"current": {"temperature_2m": 52, "apparent_temperature": 41, "weather_code": 0},
+               "daily": {"temperature_2m_max": [59, 60], "temperature_2m_min": [23, 24],
+                         "weather_code": [0, 2]}}
+    def get(*args, **kwargs):
+        requests_made.append((args, kwargs))
+        return Response(payload)
+
+    monkeypatch.setattr(weather.requests, "get", get)
+    result = read_weather(Settings(weather_latitude=10, weather_longitude=20, weather_unit="fahrenheit"))
+    assert len(requests_made) == 1
+    assert result["temperature"] == 52
+    assert result["unit"] == "°F"
+    assert (result["temperature_c"], result["temperature_f"]) == (11.1, 52)
+    assert (result["low_c"], result["low_f"]) == (-5, 23)
+    assert (result["feels_like_c"], result["feels_like_f"]) == (5, 41)
 
 
 def test_news_deduplicates_and_ignores_malformed_feed(monkeypatch):

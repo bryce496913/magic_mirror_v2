@@ -31,7 +31,11 @@ With `system` in `MIRROR_MODULES`, inspect `modules.system` in `/api/dashboard` 
 
 ## B. Weather
 
-Edit the local ignored `.env` and set both `MIRROR_WEATHER_LATITUDE` and `MIRROR_WEATHER_LONGITUDE` to coordinates you choose. Set `MIRROR_WEATHER_UNIT=celsius` or `fahrenheit`. Restart Flask. Inspect `modules.weather` in `/api/dashboard` and the weather region in Chromium. Confirm condition, temperature, high/low, and tomorrow's short forecast. Disconnect the Pi from the Internet temporarily only if it is safe for your test setup; after a failed refresh, the last successful weather snapshot should read `stale` while the clock and system region continue. Restore connectivity afterward. No default location is built in.
+![Dual-temperature weather layout at 800×480](weather-dual-preview.png)
+
+This development preview uses mocked readings to check typography and spacing; validate real weather on the Pi using the steps below.
+
+Edit the local ignored `.env` and set both `MIRROR_WEATHER_LATITUDE` and `MIRROR_WEATHER_LONGITUDE` to coordinates you choose. Set `MIRROR_WEATHER_UNIT=celsius` or `fahrenheit`. Restart Flask. Inspect `modules.weather` in `/api/dashboard` and the weather region in Chromium. Confirm current, high, low, and available feels-like readings show larger white °C beside smaller gray °F, with no clipping at the installed resolution. The original JSON temperature fields should still follow `MIRROR_WEATHER_UNIT`; `_c` and `_f` fields should show both conversions. Confirm condition and tomorrow's short forecast. Disconnect the Pi from the Internet temporarily only if it is safe for your test setup; after a failed refresh, the last successful weather snapshot should read `stale` while the clock and system region continue. Restore connectivity afterward. No default location is built in.
 
 ## C. News
 
