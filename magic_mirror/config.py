@@ -99,6 +99,7 @@ class Settings:
     led_initial_state: str = "off"
     audio_enabled: bool = False
     audio_input_device: str = "USB PnP Sound Device"
+    audio_expected_input_source: str = ""
     audio_output_device: str = "MAX98357A"
     audio_capture_rate: int = 48000
     audio_playback_rate: int = 48000
@@ -194,9 +195,12 @@ class Settings:
             raise ConfigurationError("MIRROR_LED_INITIAL_STATE must be idle, listening, responding, or off")
         audio_input = values.get("MIRROR_AUDIO_INPUT_DEVICE", "USB PnP Sound Device").strip()
         audio_output = values.get("MIRROR_AUDIO_OUTPUT_DEVICE", "MAX98357A").strip()
+        expected_source = values.get("MIRROR_AUDIO_EXPECTED_INPUT_SOURCE", "").strip()
         if any(not name or len(name) > 120 or any(char in name for char in "\r\n\x00")
                for name in (audio_input, audio_output)):
             raise ConfigurationError("Audio device selectors must be nonempty single-line names")
+        if len(expected_source) > 200 or any(char in expected_source for char in "\r\n\x00"):
+            raise ConfigurationError("MIRROR_AUDIO_EXPECTED_INPUT_SOURCE must be a single PipeWire node name")
         audio_format = values.get("MIRROR_AUDIO_FRAME_FORMAT", "int16").strip().lower()
         if audio_format not in {"int16", "float32"}:
             raise ConfigurationError("MIRROR_AUDIO_FRAME_FORMAT must be int16 or float32")
@@ -214,7 +218,8 @@ class Settings:
                    led_active_high=_bool(values, "MIRROR_LED_ACTIVE_HIGH", True),
                    led_initial_state=led_initial_state,
                    audio_enabled=_bool(values, "MIRROR_AUDIO_ENABLED", False),
-                   audio_input_device=audio_input, audio_output_device=audio_output,
+                   audio_input_device=audio_input, audio_expected_input_source=expected_source,
+                   audio_output_device=audio_output,
                    audio_capture_rate=_audio_int(values, "MIRROR_AUDIO_CAPTURE_RATE", 48000, 8000, 96000),
                    audio_playback_rate=_audio_int(values, "MIRROR_AUDIO_PLAYBACK_RATE", 48000, 8000, 96000),
                    audio_capture_channels=_audio_int(values, "MIRROR_AUDIO_CAPTURE_CHANNELS", 1, 1, 2),

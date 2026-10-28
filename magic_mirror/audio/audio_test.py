@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from magic_mirror.config import ConfigurationError, Settings
 from .core import AudioError, AudioManager
 from .devices import DeviceError
-from .pcm import levels
+from .pcm import gain_diagnostics, levels
 
 
 def _tone(settings, seconds):
@@ -47,6 +47,8 @@ def run(settings, action, seconds=5.0, backend=None, sleep=time.sleep):
                 print(f"Selected {direction}: {device.label()}; configured={rate} Hz, "
                       f"{channels} channel(s), {settings.audio_frame_format}; "
                       f"device default={device.default_rate:g} Hz")
+                if direction == "input" and manager.verified_input_source:
+                    print(f"Verified PipeWire default input: {manager.verified_input_source}")
             return
         if action not in {"tone", "record", "replay"}:
             raise ValueError("Unknown audio test action")
@@ -58,8 +60,16 @@ def run(settings, action, seconds=5.0, backend=None, sleep=time.sleep):
                 raise AudioError("Replay requires matching capture and playback rates and channels")
             manager.capture.start()
             print(f"Recording from {manager.capture.device.label()} for {seconds:g} seconds")
-            recorded = manager.capture.record(seconds)
-            manager.capture.stop()
+            if manager.verified_input_source:
+                print(f"Verified PipeWire default input: {manager.verified_input_source}")
+            try:
+                recorded = manager.capture.record(seconds)
+            finally:
+                counts = manager.capture.diagnostics()
+                print(f"Capture callbacks: {counts['callbacks']}; PortAudio input overflows: "
+                      f"{counts['input_overflows']}; queue drops: {counts['queue_overflows']}; "
+                      f"other status errors: {counts['status_errors']}")
+                manager.capture.stop()
             readings = levels(recorded, settings.audio_frame_format, settings.audio_capture_channels)
             print(f"Microphone peak: {readings['peak_dbfs']:.1f} dBFS; "
                   f"RMS: {readings['rms_dbfs']:.1f} dBFS")
@@ -68,6 +78,13 @@ def run(settings, action, seconds=5.0, backend=None, sleep=time.sleep):
             frames = recorded
         else:
             frames = _tone(settings, seconds)
+        gain_info = gain_diagnostics(frames, settings.audio_frame_format,
+                                     settings.audio_playback_channels,
+                                     settings.audio_playback_gain, settings.audio_max_playback_level)
+        print(f"Playback digital peaks: input {gain_info['input_peak_dbfs']:.1f} dBFS, "
+              f"requested {gain_info['requested_peak_dbfs']:.1f} dBFS, "
+              f"output {gain_info['output_peak_dbfs']:.1f} dBFS; "
+              f"limited samples {gain_info['limited_samples']}/{gain_info['total_samples']}")
         manager.playback.start()
         print(f"Playing through {manager.playback.device.label()}")
         manager.playback.write(frames, timeout=seconds + settings.audio_timeout)

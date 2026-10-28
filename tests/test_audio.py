@@ -12,7 +12,8 @@ from magic_mirror.audio import AudioError, AudioManager
 from magic_mirror.audio.audio_test import run
 from magic_mirror.audio.core import AudioPlayback
 from magic_mirror.audio.devices import DeviceError
-from magic_mirror.audio.pcm import PCMError, levels, playback_gain
+from magic_mirror.audio.pcm import PCMError, gain_diagnostics, levels, playback_gain
+from magic_mirror.audio.routing import pipewire_default_source
 from magic_mirror.config import ConfigurationError, Settings
 
 
@@ -87,6 +88,17 @@ class FakeBackend:
         stream.fail_start = self.fail_start
         self.outputs.append(stream)
         return stream
+
+
+class InputOverflow:
+    input_overflow = True
+    input_underflow = False
+    output_overflow = False
+    output_underflow = False
+    priming_output = False
+
+    def __bool__(self):
+        return True
 
 
 def manager(backend=None, **kwargs):
@@ -166,6 +178,7 @@ def test_capture_cancellation_disconnect_and_buffer_overflow():
         backend.inputs[-1].input(np.zeros((2, 1), dtype=np.int16))
     with pytest.raises(AudioError, match="buffer overrun"):
         audio.capture.read_frames(1)
+    assert audio.capture.diagnostics()["queue_overflows"] >= 1
     audio.close()
 
 
@@ -177,6 +190,101 @@ def test_capture_reports_device_status():
     with pytest.raises(AudioError, match="stream reported"):
         audio.capture.read_frames(1)
     audio.close()
+
+
+def test_isolated_input_overflow_is_reported_but_capture_continues(caplog):
+    backend = FakeBackend()
+    audio = manager(backend)
+    audio.capture.start()
+    backend.inputs[-1].input(np.ones((2, 1), dtype=np.int16), status=InputOverflow())
+    assert audio.capture.read_frames(2).shape == (2, 1)
+    assert audio.capture.diagnostics() == {"callbacks": 1, "input_overflows": 1,
+                                           "queue_overflows": 0, "status_errors": 0}
+    assert "audio may have gaps" in caplog.text
+    audio.capture.stop()
+    audio.capture.start()
+    assert audio.capture.diagnostics()["input_overflows"] == 0
+    audio.close()
+
+
+def test_excessive_input_overflows_fail_with_counts_and_release_cleanly():
+    backend = FakeBackend()
+    audio = manager(backend)
+    audio.capture.start()
+    for index in range(24):
+        backend.inputs[-1].input(np.ones((2, 1), dtype=np.int16),
+                                 status=InputOverflow() if index >= 21 else None)
+        if index < 23:
+            assert audio.capture.read_frames(2).shape == (2, 1)
+    with pytest.raises(AudioError, match="3 in 24 callbacks"):
+        audio.capture.read_frames(2)
+    assert audio.capture.diagnostics()["input_overflows"] == 3
+    audio.close()
+    assert backend.inputs[-1].closed
+
+
+@pytest.mark.parametrize("overflows,callbacks,excessive", [
+    (2, 24, False), (3, 24, True), (3, 100, False), (10, 1000, True),
+])
+def test_overflow_policy(overflows, callbacks, excessive):
+    audio = manager()
+    audio.capture._input_overflows = overflows
+    audio.capture._callbacks = callbacks
+    assert audio.capture._excessive_dropouts() is excessive
+
+
+def test_pipewire_default_source_requires_exact_physical_match():
+    backend = FakeBackend()
+    backend.device_rows.append({"name": "pipewire", "hostapi": 0, "max_input_channels": 1,
+                                "max_output_channels": 2, "default_samplerate": 48000})
+    backend.check_input_settings = lambda **_kwargs: None
+    expected = "alsa_input.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-mono"
+    with pytest.raises(DeviceError, match="MIRROR_AUDIO_EXPECTED_INPUT_SOURCE"):
+        manager(backend, audio_input_device="pipewire").selected("input")
+    mismatched = AudioManager(Settings(audio_input_device="pipewire", audio_expected_input_source=expected),
+                              backend, enabled=True, source_resolver=lambda _timeout: "another-source")
+    with pytest.raises(DeviceError, match="differs"):
+        mismatched.selected("input")
+    with pytest.raises(AudioError, match="differs"):
+        mismatched.capture.start()
+    assert not backend.inputs
+    observed = [expected]
+    verified = AudioManager(Settings(audio_input_device="pipewire", audio_expected_input_source=expected),
+                            backend, enabled=True, source_resolver=lambda _timeout: observed[0])
+    assert verified.selected("input").name == "pipewire"
+    assert verified.verified_input_source == expected
+    assert verified.capture.start()
+    verified.capture.stop()
+    observed[0] = "another-source"
+    with pytest.raises(AudioError, match="differs"):
+        verified.capture.start()
+    assert verified.verified_input_source is None
+    assert len(backend.inputs) == 1
+    verified.close()
+
+
+def test_pipewire_source_parser_fails_closed(monkeypatch):
+    from magic_mirror.audio import routing
+    expected = "alsa_input.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-mono"
+    monkeypatch.setattr(routing.subprocess, "run", lambda *_args, **_kwargs:
+                        SimpleNamespace(returncode=0, stdout=f'node.name = "{expected}"\n'))
+    assert pipewire_default_source(1) == expected
+    monkeypatch.setattr(routing.subprocess, "run", lambda *_args, **_kwargs:
+                        SimpleNamespace(returncode=0, stdout="no source found"))
+    with pytest.raises(DeviceError, match="no unambiguous"):
+        pipewire_default_source(1)
+    monkeypatch.setattr(routing.subprocess, "run", lambda *_args, **_kwargs: (_ for _ in ()).throw(FileNotFoundError()))
+    with pytest.raises(DeviceError, match="Cannot verify"):
+        pipewire_default_source(1)
+
+
+def test_unverifiable_logical_input_is_rejected():
+    backend = FakeBackend()
+    backend.device_rows.append({"name": "pulse", "hostapi": 0, "max_input_channels": 1,
+                                "max_output_channels": 2, "default_samplerate": 48000})
+    backend.check_input_settings = lambda **_kwargs: None
+    with pytest.raises(DeviceError, match="cannot be verified"):
+        manager(backend, audio_input_device="pulse").selected("input")
 
 
 def _capture_error(audio, errors):
@@ -308,6 +416,24 @@ def test_float_pcm_levels_and_invalid_input():
             playback_gain(value, "float32" if not isinstance(value, bytes) else "int16", 1)
 
 
+def test_gain_diagnostics_distinguish_digital_clipping_from_audible_distortion():
+    # A speech-like waveform peaking at -10 dBFS remains below 0 dBFS at 2x.
+    phase = np.arange(4800) * (2 * np.pi / 97)
+    speech = np.sin(phase) + 0.22 * np.sin(3 * phase)
+    speech = np.rint(speech / np.max(np.abs(speech)) * 32768 * 10 ** (-10 / 20)).astype(np.int16)
+    for gain in (1.0, 1.4, 2.0):
+        report = gain_diagnostics(speech, "int16", 1, gain, 1.0)
+        assert report["input_peak_dbfs"] == pytest.approx(-10, abs=0.02)
+        assert report["limited_samples"] == 0
+        assert report["requested_peak_dbfs"] == pytest.approx(-10 + 20 * np.log10(gain), abs=0.02)
+    loud = np.array([0, 20000, -20000, 32767, -32768], dtype=np.int16)
+    report = gain_diagnostics(loud, "int16", 1, 2.0, 1.0)
+    assert report["limited_samples"] == 4
+    assert report["output_peak_dbfs"] <= 0
+    assert playback_gain(loud, "int16", 1, 2.0, 1.0).ravel().tolist() == [0, 32767, -32768, 32767, -32768]
+    assert gain_diagnostics(np.zeros(10, dtype=np.int16), "int16", 1, 1.4, 1.0)["limited_samples"] == 0
+
+
 def test_cli_lists_and_selects_without_opening_streams(capsys):
     backend = FakeBackend()
     settings = Settings()
@@ -346,7 +472,27 @@ def test_cli_record_replay_tone_and_interruption(monkeypatch, capsys):
     assert all(stream.closed for stream in backend.inputs + backend.outputs)
     output = capsys.readouterr().out
     assert "Microphone peak:" in output and "RMS:" in output
+    assert "Capture callbacks:" in output and "Playback digital peaks:" in output
     assert "MAX98357A" in output and "USB PnP Sound Device" in output
+
+
+def test_cli_reports_excessive_overflows_even_when_recording_fails(capsys):
+    backend = FakeBackend()
+    original_input = backend.InputStream
+    def input_stream(**kwargs):
+        stream = original_input(**kwargs)
+        original_start = stream.start
+        def start():
+            original_start()
+            for _ in range(3):
+                stream.input(np.zeros((1600, 1), dtype=np.int16), status=InputOverflow())
+        stream.start = start
+        return stream
+    backend.InputStream = input_stream
+    with pytest.raises(AudioError, match="excessive input overflows"):
+        run(Settings(), "record", seconds=0.1, backend=backend)
+    assert "PortAudio input overflows: 3" in capsys.readouterr().out
+    assert backend.inputs[-1].closed
 
 
 def test_disabled_audio_and_dashboard_independence():
@@ -410,6 +556,7 @@ def test_flask_keyboard_interrupt_closes_audio_without_opening_it(monkeypatch):
     {"MIRROR_AUDIO_PLAYBACK_GAIN": "5"},
     {"MIRROR_AUDIO_MAX_PLAYBACK_LEVEL": "0"},
     {"MIRROR_AUDIO_TIMEOUT": "0"},
+    {"MIRROR_AUDIO_EXPECTED_INPUT_SOURCE": "bad\nsource"},
 ])
 def test_invalid_audio_config(values):
     with pytest.raises(ConfigurationError):
@@ -425,3 +572,4 @@ def test_audio_config_defaults_and_overrides():
     assert settings.audio_enabled and settings.audio_capture_rate == 44100
     assert settings.audio_playback_rate == 44100 and settings.audio_frame_format == "float32"
     assert settings.audio_playback_gain == 2 and settings.audio_max_playback_level == 0.9
+    assert Settings.from_env({"MIRROR_AUDIO_EXPECTED_INPUT_SOURCE": "alsa_input.usb-example"}).audio_expected_input_source == "alsa_input.usb-example"

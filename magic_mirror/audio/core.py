@@ -1,6 +1,7 @@
 """Explicit PortAudio stream owners with bounded in-memory frame buffers."""
 
 from collections import deque
+import logging
 from queue import Empty, Full, Queue
 from threading import Condition, Event, Lock, RLock
 from time import monotonic
@@ -8,7 +9,8 @@ from time import monotonic
 import numpy as np
 
 from .devices import DeviceError, check_format, list_devices, select_device
-from .pcm import PCMError, playback_gain
+from .pcm import playback_gain
+from .routing import pipewire_default_source
 
 
 class AudioError(RuntimeError):
@@ -18,10 +20,12 @@ class AudioError(RuntimeError):
 class AudioManager:
     """One in-process capture and playback owner; construction opens no audio device."""
 
-    def __init__(self, settings, backend=None, *, enabled=None):
+    def __init__(self, settings, backend=None, *, enabled=None, source_resolver=None):
         self.settings = settings
         self.enabled = settings.audio_enabled if enabled is None else enabled
         self._sd = backend
+        self._source_resolver = source_resolver or pipewire_default_source
+        self.verified_input_source = None
         self.capture = AudioCapture(self)
         self.playback = AudioPlayback(self)
 
@@ -45,8 +49,21 @@ class AudioManager:
         selector = settings.audio_input_device if direction == "input" else settings.audio_output_device
         channels = settings.audio_capture_channels if direction == "input" else settings.audio_playback_channels
         rate = settings.audio_capture_rate if direction == "input" else settings.audio_playback_rate
+        if direction == "input":
+            self.verified_input_source = None
         device = select_device(self.devices(), selector, direction, channels)
         check_format(self.backend, device, direction, channels, rate, settings.audio_frame_format)
+        if direction == "input":
+            if device.name.casefold().startswith("pipewire"):
+                expected = settings.audio_expected_input_source
+                if not expected:
+                    raise DeviceError("PipeWire input requires MIRROR_AUDIO_EXPECTED_INPUT_SOURCE to verify its physical source")
+                observed = self._source_resolver(settings.audio_timeout)
+                if observed != expected:
+                    raise DeviceError("PipeWire default input differs from MIRROR_AUDIO_EXPECTED_INPUT_SOURCE")
+                self.verified_input_source = observed
+            elif device.name.casefold() in {"pulse", "default"}:
+                raise DeviceError("Logical input routing cannot be verified; select PipeWire with an expected source or a direct USB device")
         return device
 
     def close(self):
@@ -74,7 +91,22 @@ class AudioCapture:
         self._remainder = None
         self._stream = None
         self._error = None
+        self._callbacks = 0
+        self._input_overflows = 0
+        self._queue_overflows = 0
+        self._status_errors = 0
+        self._reported_overflows = 0
         self.device = None
+
+    def diagnostics(self):
+        """Return safe counters; no captured samples or speech content."""
+        return {"callbacks": self._callbacks, "input_overflows": self._input_overflows,
+                "queue_overflows": self._queue_overflows, "status_errors": self._status_errors}
+
+    def _excessive_dropouts(self):
+        # Three warnings above five percent, or ten warnings at any rate.
+        return self._input_overflows >= 10 or (
+            self._input_overflows >= 3 and self._input_overflows * 20 > self._callbacks)
 
     def _claim(self):
         with AudioCapture._claim_lock:
@@ -101,15 +133,31 @@ class AudioCapture:
                 self._frames = Queue(maxsize=8)
                 self._remainder = None
                 self._error = None
+                self._callbacks = 0
+                self._input_overflows = 0
+                self._queue_overflows = 0
+                self._status_errors = 0
+                self._reported_overflows = 0
                 self._stop.clear()
 
                 def callback(indata, _frames, _time, status):
+                    self._callbacks += 1
                     if status:
-                        self._error = "Microphone stream reported a device or buffer error"
+                        if getattr(status, "input_overflow", False):
+                            self._input_overflows += 1
+                        if not getattr(status, "input_overflow", False) or any(
+                            getattr(status, name, False) for name in
+                            ("input_underflow", "output_overflow", "output_underflow", "priming_output")
+                        ):
+                            self._status_errors += 1
+                            self._error = "Microphone stream reported a device or buffer error"
                     if not self._stop.is_set():
                         try:
+                            if self._frames.full():
+                                raise Full
                             self._frames.put_nowait(indata.copy())
                         except Full:
+                            self._queue_overflows += 1
                             self._error = "Microphone buffer overrun"
 
                 stream = self.manager.backend.InputStream(
@@ -157,6 +205,9 @@ class AudioCapture:
                     raise AudioError("Microphone capture was cancelled")
                 if self._error:
                     raise AudioError(self._error)
+                if self._excessive_dropouts():
+                    raise AudioError("Microphone capture has excessive input overflows; audio may have gaps "
+                                     f"({self._input_overflows} in {self._callbacks} callbacks)")
                 chunk = self._remainder
                 self._remainder = None
                 if chunk is None:
@@ -172,6 +223,14 @@ class AudioCapture:
                 if take < len(chunk):
                     self._remainder = chunk[take:]
                 remaining -= take
+            if self._excessive_dropouts():
+                raise AudioError("Microphone capture has excessive input overflows; audio may have gaps "
+                                 f"({self._input_overflows} in {self._callbacks} callbacks)")
+            if self._input_overflows > self._reported_overflows:
+                logging.getLogger("magic_mirror.audio").warning(
+                    "Microphone input overflows: %s in %s callbacks; captured audio may have gaps",
+                    self._input_overflows, self._callbacks)
+                self._reported_overflows = self._input_overflows
             return np.concatenate(chunks, axis=0)
         finally:
             self._read_lock.release()
