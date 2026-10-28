@@ -12,8 +12,9 @@ Preview captured in headless Chromium during development. Check contrast and spa
 - `python3-venv` and `python3-pip` from Debian, if they are not already installed
 - Network access to PyPI for the first dependency installation
 - No root access to run the application
+- `libportaudio2` on the Pi for microphone and speaker tests (check with `dpkg-query -W libportaudio2`)
 
-Runtime libraries are Flask, python-dotenv, psutil, requests, defusedxml, gpiozero, and lgpio. `pytest` is used for development. `requirements.txt` pins direct and transitive Python packages to tested versions; it does not install system packages. The LED packages install into the project virtual environment, and GPIO is not opened unless explicitly enabled or tested with the standalone command.
+Runtime libraries are Flask, python-dotenv, psutil, requests, defusedxml, gpiozero, lgpio, sounddevice, and NumPy. `pytest` is used for development. `requirements.txt` pins direct and transitive Python packages to tested versions; it does not install system packages. GPIO and audio streams remain closed until explicitly requested.
 
 ## Project layout
 
@@ -25,6 +26,7 @@ magic_mirror/
   data.py               background refresh schedules and cached snapshots
   providers/            read-only system, weather, news, and Pi-hole sources
   hardware/             RGB LED controller and standalone hardware test command
+  audio/                device selection, bounded capture/playback, PCM gain, test CLI
   dashboard/            routes, template, local CSS, and small JavaScript modules
 tests/                  hardware-free application and configuration tests
 scripts/run_pi.sh       manual Raspberry Pi launcher
@@ -49,7 +51,7 @@ test -f .env || cp .env.example .env
 ./scripts/run_pi.sh
 ```
 
-If `python3 -m venv .venv` reports that `ensurepip` is unavailable, install Debian's `python3-venv` package using your normal package administration process, then repeat the command. No system Python packages are changed by the commands above. The `.env` command preserves an existing local configuration. The launcher changes into the project directory and uses its `.venv`. Existing installations should rerun `.venv/bin/python -m pip install -r requirements.txt` for the current dashboard and LED dependencies.
+If `python3 -m venv .venv` reports that `ensurepip` is unavailable, install Debian's `python3-venv` package using your normal package administration process, then repeat the command. No system Python packages are changed by the commands above. The `.env` command preserves an existing local configuration. The launcher changes into the project directory and uses its `.venv`. Existing installations should rerun `.venv/bin/python -m pip install -r requirements.txt` for the current dashboard, LED, and audio dependencies. If `libportaudio2` is missing, have the Pi's package administrator install that Debian package separately.
 
 ## Manual operation
 
@@ -83,6 +85,16 @@ The expected response is `{"status":"healthy"}`. Stop the foreground server with
 | `MIRROR_LED_RED_PIN`, `MIRROR_LED_GREEN_PIN`, `MIRROR_LED_BLUE_PIN` | `22`, `27`, `24` | Distinct BCM GPIO numbers, each 0–27. Physical pins 15, 13, 18 on the tested Pi 4B. |
 | `MIRROR_LED_ACTIVE_HIGH` | `true` | `true` for the verified active-high LED; `false` for active-low wiring. |
 | `MIRROR_LED_INITIAL_STATE` | `off` | `idle`, `listening`, `responding`, or `off` when GPIO is first enabled. All channels initialize off before this state is applied. |
+| `MIRROR_AUDIO_ENABLED` | `false` | Allow in-process audio stream starts; Flask never opens a stream automatically. The explicit test CLI works while this is `false`. |
+| `MIRROR_AUDIO_INPUT_DEVICE` | `USB PnP Sound Device` | PortAudio microphone name or unique substring; optional `HostAPI:name` to disambiguate. No automatic fallback. |
+| `MIRROR_AUDIO_OUTPUT_DEVICE` | `MAX98357A` | PortAudio speaker name or unique substring; optional `HostAPI:name`. No HDMI fallback. |
+| `MIRROR_AUDIO_CAPTURE_RATE`, `MIRROR_AUDIO_PLAYBACK_RATE` | `48000`, `48000` | Hz, each 8000–96000; the selected PortAudio devices must support the requested values. Replay requires matching rates. |
+| `MIRROR_AUDIO_CAPTURE_CHANNELS`, `MIRROR_AUDIO_PLAYBACK_CHANNELS` | `1`, `1` | Mono by default; each may be 1 or 2 if supported by the device. Replay requires matching channels. |
+| `MIRROR_AUDIO_BUFFER_DURATION` | `0.1` | Callback buffer duration in seconds, 0.02–1.0; up to eight buffers are queued per direction. |
+| `MIRROR_AUDIO_FRAME_FORMAT` | `int16` | `int16` or `float32` PCM. |
+| `MIRROR_AUDIO_PLAYBACK_GAIN` | `1.0` | Software speaker gain, 0–4. A value of `2.0` is about +6 dB before limiting. |
+| `MIRROR_AUDIO_MAX_PLAYBACK_LEVEL` | `1.0` | Peak ceiling, 0.1–1.0 of full scale; samples saturate before integer conversion. |
+| `MIRROR_AUDIO_TIMEOUT` | `5.0` | Seconds, 0.1–30, for waiting on capture, playback queue space, and drain. |
 
 The clock uses the Pi's configured local timezone through Chromium. Change the Pi's system timezone if the clock shows the wrong local time, then refresh Chromium. The clock checks the current time at minute boundaries and refreshes when the page becomes visible again. The browser requests one cached `/api/dashboard` JSON snapshot every 15 seconds while visible. Up to four background workers, one per enabled data provider, run on independent schedules; they never run in page routes or overlap their own refreshes. Successful snapshots stay in memory until the process exits; failed refreshes retain last-known-good values with a stale label and a UTC last-success timestamp. The endpoint returns data only, never feed URLs, coordinates, passwords, or session IDs. No external HTTP requests occur during application initialization or page rendering.
 
@@ -95,6 +107,10 @@ For a Pi-hole installation with a private CA, set `MIRROR_PIHOLE_URL=https://pi.
 The RGB LED controller uses one `LGPIOFactory` and three gpiozero `LED` outputs. `idle` lights red, green, and blue (white); `listening` lights green; `responding` lights blue; `off` extinguishes all channels. Transitions turn obsolete channels off before lighting new ones. The main Flask process owns the controller only when `MIRROR_LED_ENABLED=true` and releases every pin on Ctrl+C, SIGTERM, or startup failure. The default is disabled and off. The assistant region remains an honest placeholder; no assistant event source or GPIO control route exists in this pass. Run the standalone hardware command only while Flask is stopped, so there is a single GPIO owner.
 
 For exact Raspberry Pi LED test commands and acceptance checks, see [Pass 4 hardware validation](docs/PASS4_PI_VALIDATION.md).
+
+Audio is owned by one in-process `AudioManager`, exposed to future internal integrations through `app.extensions["magic_mirror_audio"]`. It does not open a microphone or speaker on Flask startup, even when audio is enabled. Explicit start methods claim one capture and one playback owner process-wide; another attempt fails clearly. Capture reads bounded mono PCM frames or records up to 30 seconds in memory. Playback accepts bounded PCM, uses a maximum eight-buffer queue, and applies optional gain with saturation instead of integer wraparound. Cancel and shutdown abort and close both streams. The standalone CLI records nothing to disk and sends no audio over the network. No audio control HTTP route or assistant integration exists.
+
+The USB microphone and MAX98357A defaults are **selection preferences**, not guaranteed PortAudio identifiers. PortAudio can expose ALSA devices, PipeWire/PulseAudio logical devices, or both under different names. A direct ALSA device may bypass PipeWire mixing and routing even if its card name resembles a PipeWire sink. Run the CLI device list and selection checks on the Pi, set exact unique PortAudio names in the ignored `.env`, then test each physical path. There is no automatic fallback to HDMI. The default 48 kHz mono format must be confirmed against the selected PortAudio device; unsupported settings fail rather than silently resample. For exact commands, see [Pass 5 audio validation](docs/PASS5_PI_VALIDATION.md).
 
 For the hardware validation steps, including a private Pi-hole credential setup procedure and version check, see [Pass 3 Raspberry Pi validation](docs/PASS3_PI_VALIDATION.md).
 
@@ -117,6 +133,7 @@ Verify the live clock advances across a minute boundary without refresh, the dat
 - `ModuleNotFoundError` usually means dependencies were not installed into `.venv` or the wrong Python interpreter was used. Repeat the installation command and launch through `scripts/run_pi.sh`.
 - If Chromium cannot reach the page, verify `/health` locally first and make sure Chromium runs on the same Pi. Localhost binding intentionally does not expose the server to other devices.
 - If LED startup reports a GPIO error, check the BCM pin numbers, wiring polarity, and that no other process owns those pins. Run the standalone LED test as the normal Pi user after stopping Flask. Do not use sudo.
+- If audio discovery fails, use the standalone `audio_test list` command and set a unique PortAudio device name in `.env`. If PortAudio cannot load, check `dpkg-query -W libportaudio2`. Test a supported rate and channel count with `audio_test selected` before recording or playback.
 - If dependency installation fails, verify Python is at least 3.11, PyPI is reachable, and `.venv/bin/python -m pip` is being used.
 - If Pi-hole HTTPS is unavailable, check that `MIRROR_PIHOLE_CA_CERT` is an absolute path to the trusted CA certificate, readable by the Flask user, and that the certificate covers the hostname in `MIRROR_PIHOLE_URL`. Do not turn off certificate verification.
 
@@ -132,3 +149,4 @@ Verify the live clock advances across a minute boundary without refresh, the dat
 - [ ] Confirm the application's default bind address is localhost and existing Pi-hole behavior is unaffected.
 - [ ] Run the standalone RGB LED test on the Pi: white → green → blue → off, individual colors, Ctrl+C cleanup, and a repeat without reboot.
 - [ ] If enabling the LED in Flask, confirm GPIO releases after Ctrl+C and the dashboard and Pi-hole continue working.
+- [ ] List PortAudio devices, select the USB microphone and MAX98357A path, record five seconds, play a controlled tone, replay the sample, and repeat after Ctrl+C without restarting the Pi.

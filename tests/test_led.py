@@ -283,7 +283,7 @@ def test_flask_lifecycle_owns_led_only_when_enabled(monkeypatch, enabled):
     monkeypatch.setattr(entry, "configure_logging", lambda _level: None)
     monkeypatch.setattr(entry, "DashboardData", lambda _settings: FakeData())
     monkeypatch.setattr(entry, "RGBLedController", FakeLed)
-    monkeypatch.setattr(entry, "create_app", lambda _settings, _data, led: FakeApp())
+    monkeypatch.setattr(entry, "create_app", lambda _settings, _data, led, audio: FakeApp())
     monkeypatch.setattr(entry.signal, "signal", lambda *_args: None)
     assert entry.main() == 0
     if enabled:
@@ -318,7 +318,7 @@ def test_led_startup_failure_stops_data_and_releases_pins(monkeypatch):
     monkeypatch.setattr(entry, "configure_logging", lambda _level: None)
     monkeypatch.setattr(entry, "DashboardData", lambda _settings: FakeData())
     monkeypatch.setattr(entry, "RGBLedController", FakeLed)
-    monkeypatch.setattr(entry, "create_app", lambda _settings, _data, led: object())
+    monkeypatch.setattr(entry, "create_app", lambda _settings, _data, led, audio: object())
     monkeypatch.setattr(entry.signal, "signal", lambda *_args: None)
     assert entry.main() == 1
     assert events == ["led-open", "data-stop", "led-close"]

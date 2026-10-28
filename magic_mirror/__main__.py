@@ -7,6 +7,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .audio import AudioError, AudioManager
 from .app import create_app
 from .config import ConfigurationError, Settings, configure_logging
 from .data import DashboardData
@@ -25,7 +26,8 @@ def main() -> int:
     logger = logging.getLogger("magic_mirror")
     data = DashboardData(settings)
     led = RGBLedController(settings) if settings.led_enabled else None
-    app = create_app(settings, data, led=led)
+    audio = AudioManager(settings)
+    app = create_app(settings, data, led=led, audio=audio)
     # Werkzeug handles Ctrl+C itself; make a manual SIGTERM follow the same path.
     def stop_server(_signum, _frame):
         raise KeyboardInterrupt
@@ -51,12 +53,18 @@ def main() -> int:
             if not data.stop():
                 logger.warning("Dashboard data workers still finishing bounded requests at process exit")
         finally:
-            if led is not None:
-                try:
-                    led.close()
-                except LedError as exc:
-                    logger.error("LED cleanup failed: %s", exc)
-                    exit_code = 1
+            try:
+                audio.close()
+            except AudioError as exc:
+                logger.error("Audio cleanup failed: %s", exc)
+                exit_code = 1
+            finally:
+                if led is not None:
+                    try:
+                        led.close()
+                    except LedError as exc:
+                        logger.error("LED cleanup failed: %s", exc)
+                        exit_code = 1
         logger.info("Magic Mirror V2 stopped")
     return exit_code
 
