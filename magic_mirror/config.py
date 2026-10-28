@@ -13,6 +13,24 @@ class ConfigurationError(ValueError):
 
 
 DASHBOARD_MODULES = ("weather", "news", "pihole", "system", "assistant")
+LED_STATES = ("idle", "listening", "responding", "off")
+
+
+def _led_pin(values: Mapping[str, str], name: str, default: int) -> int:
+    try:
+        pin = int(values.get(name, str(default)))
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be a BCM GPIO number from 0 to 27") from exc
+    if not 0 <= pin <= 27:
+        raise ConfigurationError(f"{name} must be a BCM GPIO number from 0 to 27")
+    return pin
+
+
+def _led_bool(values: Mapping[str, str], name: str, default: bool) -> bool:
+    value = values.get(name, "true" if default else "false").strip().lower()
+    if value not in {"true", "false"}:
+        raise ConfigurationError(f"{name} must be true or false")
+    return value == "true"
 
 
 def _interval(values: Mapping[str, str], name: str, default: int, minimum: int) -> int:
@@ -52,6 +70,12 @@ class Settings:
     weather_interval: int = 900
     news_interval: int = 1800
     pihole_interval: int = 60
+    led_enabled: bool = False
+    led_red_pin: int = 22
+    led_green_pin: int = 27
+    led_blue_pin: int = 24
+    led_active_high: bool = True
+    led_initial_state: str = "off"
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "Settings":
@@ -127,6 +151,14 @@ class Settings:
                     pass
             except OSError as exc:
                 raise ConfigurationError("MIRROR_PIHOLE_CA_CERT must point to a readable file") from exc
+        led_pins = (_led_pin(values, "MIRROR_LED_RED_PIN", 22),
+                    _led_pin(values, "MIRROR_LED_GREEN_PIN", 27),
+                    _led_pin(values, "MIRROR_LED_BLUE_PIN", 24))
+        if len(set(led_pins)) != 3:
+            raise ConfigurationError("LED channels must use distinct BCM GPIO pins")
+        led_initial_state = values.get("MIRROR_LED_INITIAL_STATE", "off").strip().lower()
+        if led_initial_state not in LED_STATES:
+            raise ConfigurationError("MIRROR_LED_INITIAL_STATE must be idle, listening, responding, or off")
         return cls(host=host, port=port, log_level=level, clock_format=clock_format,
                    display_scale=display_scale, enabled_modules=modules,
                    weather_latitude=latitude, weather_longitude=longitude, weather_unit=unit,
@@ -135,7 +167,11 @@ class Settings:
                    system_interval=_interval(values, "MIRROR_SYSTEM_INTERVAL", 15, 5),
                    weather_interval=_interval(values, "MIRROR_WEATHER_INTERVAL", 900, 300),
                    news_interval=_interval(values, "MIRROR_NEWS_INTERVAL", 1800, 300),
-                   pihole_interval=_interval(values, "MIRROR_PIHOLE_INTERVAL", 60, 15))
+                   pihole_interval=_interval(values, "MIRROR_PIHOLE_INTERVAL", 60, 15),
+                   led_enabled=_led_bool(values, "MIRROR_LED_ENABLED", False),
+                   led_red_pin=led_pins[0], led_green_pin=led_pins[1], led_blue_pin=led_pins[2],
+                   led_active_high=_led_bool(values, "MIRROR_LED_ACTIVE_HIGH", True),
+                   led_initial_state=led_initial_state)
 
 
 def configure_logging(level: str) -> None:
