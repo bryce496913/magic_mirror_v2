@@ -13,7 +13,7 @@ Preview captured in headless Chromium during development. Check contrast and spa
 - Network access to PyPI for the first dependency installation
 - No root access to run the application
 
-Runtime libraries are Flask, python-dotenv, psutil, requests, and defusedxml. `pytest` is used for development. `requirements.txt` pins direct and transitive Python packages to tested versions; it does not install system packages.
+Runtime libraries are Flask, python-dotenv, psutil, requests, defusedxml, gpiozero, and lgpio. `pytest` is used for development. `requirements.txt` pins direct and transitive Python packages to tested versions; it does not install system packages. The LED packages install into the project virtual environment, and GPIO is not opened unless explicitly enabled or tested with the standalone command.
 
 ## Project layout
 
@@ -24,6 +24,7 @@ magic_mirror/
   config.py             environment configuration and logging
   data.py               background refresh schedules and cached snapshots
   providers/            read-only system, weather, news, and Pi-hole sources
+  hardware/             RGB LED controller and standalone hardware test command
   dashboard/            routes, template, local CSS, and small JavaScript modules
 tests/                  hardware-free application and configuration tests
 scripts/run_pi.sh       manual Raspberry Pi launcher
@@ -48,7 +49,7 @@ test -f .env || cp .env.example .env
 ./scripts/run_pi.sh
 ```
 
-If `python3 -m venv .venv` reports that `ensurepip` is unavailable, install Debian's `python3-venv` package using your normal package administration process, then repeat the command. No system Python packages are changed by the commands above. The `.env` command preserves an existing local configuration. The launcher changes into the project directory and uses its `.venv`. Existing installations should rerun `.venv/bin/python -m pip install -r requirements.txt` for the Pass 3 providers.
+If `python3 -m venv .venv` reports that `ensurepip` is unavailable, install Debian's `python3-venv` package using your normal package administration process, then repeat the command. No system Python packages are changed by the commands above. The `.env` command preserves an existing local configuration. The launcher changes into the project directory and uses its `.venv`. Existing installations should rerun `.venv/bin/python -m pip install -r requirements.txt` for the current dashboard and LED dependencies.
 
 ## Manual operation
 
@@ -78,6 +79,10 @@ The expected response is `{"status":"healthy"}`. Stop the foreground server with
 | `MIRROR_WEATHER_INTERVAL` | `900` | Weather refresh seconds, minimum 300. |
 | `MIRROR_NEWS_INTERVAL` | `1800` | News refresh seconds, minimum 300. |
 | `MIRROR_PIHOLE_INTERVAL` | `60` | Pi-hole refresh seconds, minimum 15. |
+| `MIRROR_LED_ENABLED` | `false` | Claim GPIO on Flask startup only when explicitly `true`. |
+| `MIRROR_LED_RED_PIN`, `MIRROR_LED_GREEN_PIN`, `MIRROR_LED_BLUE_PIN` | `22`, `27`, `24` | Distinct BCM GPIO numbers, each 0–27. Physical pins 15, 13, 18 on the tested Pi 4B. |
+| `MIRROR_LED_ACTIVE_HIGH` | `true` | `true` for the verified active-high LED; `false` for active-low wiring. |
+| `MIRROR_LED_INITIAL_STATE` | `off` | `idle`, `listening`, `responding`, or `off` when GPIO is first enabled. All channels initialize off before this state is applied. |
 
 The clock uses the Pi's configured local timezone through Chromium. Change the Pi's system timezone if the clock shows the wrong local time, then refresh Chromium. The clock checks the current time at minute boundaries and refreshes when the page becomes visible again. The browser requests one cached `/api/dashboard` JSON snapshot every 15 seconds while visible. Up to four background workers, one per enabled data provider, run on independent schedules; they never run in page routes or overlap their own refreshes. Successful snapshots stay in memory until the process exits; failed refreshes retain last-known-good values with a stale label and a UTC last-success timestamp. The endpoint returns data only, never feed URLs, coordinates, passwords, or session IDs. No external HTTP requests occur during application initialization or page rendering.
 
@@ -86,6 +91,10 @@ On shutdown, all workers receive a stop signal and no new refresh starts. The ap
 Open-Meteo supplies current temperature, condition, high/low, feels-like when available, and tomorrow's short forecast. Each weather reading shows Celsius in larger white type followed by Fahrenheit in smaller gray type. Both values are calculated from the same response; no second API request is made. Existing JSON fields (`temperature`, `high`, `low`, `feels_like`, and `unit`) keep their configured source units; additional `_c` and `_f` fields supply the dual display. RSS/Atom feeds supply at most three deduplicated titles with publisher and publication time when available. News text is inserted as text, and article scripts or images are never loaded. The Pi-hole provider implements the v6 `/api/stats/summary`, `/api/dns/blocking`, and session authentication contract documented by Pi-hole; it only reads statistics and blocking status after authentication. The system provider reads psutil and Linux thermal data without privilege. CPU temperature shows an unavailable marker if no sensor is present.
 
 For a Pi-hole installation with a private CA, set `MIRROR_PIHOLE_URL=https://pi.hole` and point `MIRROR_PIHOLE_CA_CERT` to the absolute path of the trusted CA certificate file in the ignored local `.env`. Keep the CA certificate and application password in a private directory such as `.private/` (ignored by Git) or outside the repository, with permissions limited to the application user. The CA file must exist and be readable at startup. Pi-hole authentication, statistics, and blocking requests then verify HTTPS against that CA; an invalid certificate or hostname causes the Pi-hole module to become unavailable or stale. Without a custom CA, requests use the normal certificate trust store. Weather and news continue using their own normal certificate trust settings.
+
+The RGB LED controller uses one `LGPIOFactory` and three gpiozero `LED` outputs. `idle` lights red, green, and blue (white); `listening` lights green; `responding` lights blue; `off` extinguishes all channels. Transitions turn obsolete channels off before lighting new ones. The main Flask process owns the controller only when `MIRROR_LED_ENABLED=true` and releases every pin on Ctrl+C, SIGTERM, or startup failure. The default is disabled and off. The assistant region remains an honest placeholder; no assistant event source or GPIO control route exists in this pass. Run the standalone hardware command only while Flask is stopped, so there is a single GPIO owner.
+
+For exact Raspberry Pi LED test commands and acceptance checks, see [Pass 4 hardware validation](docs/PASS4_PI_VALIDATION.md).
 
 For the hardware validation steps, including a private Pi-hole credential setup procedure and version check, see [Pass 3 Raspberry Pi validation](docs/PASS3_PI_VALIDATION.md).
 
@@ -107,6 +116,7 @@ Verify the live clock advances across a minute boundary without refresh, the dat
 - `Address already in use` means the selected port is occupied. Choose a free port in `.env`; do not stop an unrelated service.
 - `ModuleNotFoundError` usually means dependencies were not installed into `.venv` or the wrong Python interpreter was used. Repeat the installation command and launch through `scripts/run_pi.sh`.
 - If Chromium cannot reach the page, verify `/health` locally first and make sure Chromium runs on the same Pi. Localhost binding intentionally does not expose the server to other devices.
+- If LED startup reports a GPIO error, check the BCM pin numbers, wiring polarity, and that no other process owns those pins. Run the standalone LED test as the normal Pi user after stopping Flask. Do not use sudo.
 - If dependency installation fails, verify Python is at least 3.11, PyPI is reachable, and `.venv/bin/python -m pip` is being used.
 - If Pi-hole HTTPS is unavailable, check that `MIRROR_PIHOLE_CA_CERT` is an absolute path to the trusted CA certificate, readable by the Flask user, and that the certificate covers the hostname in `MIRROR_PIHOLE_URL`. Do not turn off certificate verification.
 
@@ -120,3 +130,5 @@ Verify the live clock advances across a minute boundary without refresh, the dat
 - [ ] `curl http://127.0.0.1:5000/health` returns `{"status":"healthy"}`.
 - [ ] Press Ctrl+C; the server stops cleanly and releases its port.
 - [ ] Confirm the application's default bind address is localhost and existing Pi-hole behavior is unaffected.
+- [ ] Run the standalone RGB LED test on the Pi: white → green → blue → off, individual colors, Ctrl+C cleanup, and a repeat without reboot.
+- [ ] If enabling the LED in Flask, confirm GPIO releases after Ctrl+C and the dashboard and Pi-hole continue working.
