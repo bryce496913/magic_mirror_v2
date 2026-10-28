@@ -24,6 +24,50 @@ def test_dashboard_configuration():
     assert Settings.from_env({"MIRROR_MODULES": ""}).enabled_modules == ()
 
 
+def test_live_module_configuration():
+    settings = Settings.from_env({
+        "MIRROR_WEATHER_LATITUDE": "40.7", "MIRROR_WEATHER_LONGITUDE": "-74.0",
+        "MIRROR_WEATHER_UNIT": "fahrenheit", "MIRROR_NEWS_FEEDS": "https://example.com/rss",
+        "MIRROR_SYSTEM_INTERVAL": "20", "MIRROR_PIHOLE_URL": "http://127.0.0.1",
+        "MIRROR_PIHOLE_PASSWORD_FILE": "/tmp/local-password",
+    })
+    assert settings.weather_latitude == 40.7
+    assert settings.weather_unit == "fahrenheit"
+    assert settings.news_feeds == ("https://example.com/rss",)
+    assert settings.system_interval == 20
+    assert settings.pihole_password_file == "/tmp/local-password"
+
+
+def test_pihole_ca_certificate_path(tmp_path):
+    ca_cert = tmp_path / "local-ca.crt"
+    ca_cert.write_text("test fixture only")
+    settings = Settings.from_env({"MIRROR_PIHOLE_URL": "https://pi.hole",
+                                  "MIRROR_PIHOLE_CA_CERT": str(ca_cert)})
+    assert settings.pihole_ca_cert == str(ca_cert)
+
+
+@pytest.mark.parametrize("ca_path", ["relative-ca.crt", "/nonexistent/mirror-ca.crt"])
+def test_invalid_pihole_ca_certificate_path(ca_path):
+    with pytest.raises(ConfigurationError, match="MIRROR_PIHOLE_CA_CERT"):
+        Settings.from_env({"MIRROR_PIHOLE_URL": "https://pi.hole",
+                           "MIRROR_PIHOLE_CA_CERT": ca_path})
+
+
+def test_pihole_ca_certificate_must_be_readable_https_file(tmp_path, monkeypatch):
+    with pytest.raises(ConfigurationError, match="MIRROR_PIHOLE_CA_CERT"):
+        Settings.from_env({"MIRROR_PIHOLE_URL": "https://pi.hole",
+                           "MIRROR_PIHOLE_CA_CERT": str(tmp_path)})
+    ca_cert = tmp_path / "local-ca.crt"
+    ca_cert.write_text("test fixture only")
+    with pytest.raises(ConfigurationError, match="requires an HTTPS"):
+        Settings.from_env({"MIRROR_PIHOLE_CA_CERT": str(ca_cert)})
+    with monkeypatch.context() as patch:
+        patch.setattr("builtins.open", lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError()))
+        with pytest.raises(ConfigurationError, match="readable file"):
+            Settings.from_env({"MIRROR_PIHOLE_URL": "https://pi.hole",
+                               "MIRROR_PIHOLE_CA_CERT": str(ca_cert)})
+
+
 @pytest.mark.parametrize(
     "values",
     [
@@ -38,6 +82,16 @@ def test_dashboard_configuration():
         {"MIRROR_DISPLAY_SCALE": "0.5"},
         {"MIRROR_MODULES": "weather,weather"},
         {"MIRROR_MODULES": "weather,unknown"},
+        {"MIRROR_WEATHER_LATITUDE": "40"},
+        {"MIRROR_WEATHER_LATITUDE": "91", "MIRROR_WEATHER_LONGITUDE": "0"},
+        {"MIRROR_WEATHER_LATITUDE": "nan", "MIRROR_WEATHER_LONGITUDE": "0"},
+        {"MIRROR_WEATHER_UNIT": "kelvin"},
+        {"MIRROR_NEWS_FEEDS": "https://user:password@example.com/rss"},
+        {"MIRROR_NEWS_FEEDS": "file:///etc/passwd"},
+        {"MIRROR_PIHOLE_PASSWORD_FILE": "relative-secret"},
+        {"MIRROR_PIHOLE_URL": "http://192.0.2.1", "MIRROR_PIHOLE_PASSWORD_FILE": "/tmp/secret"},
+        {"MIRROR_SYSTEM_INTERVAL": "1"},
+        {"MIRROR_WEATHER_INTERVAL": "bad"},
     ],
 )
 def test_invalid_configuration(values):

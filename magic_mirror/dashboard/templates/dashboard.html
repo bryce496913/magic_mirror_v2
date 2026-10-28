@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="{{ url_for('dashboard.static', filename='dashboard.css') }}">
   <script defer src="{{ url_for('dashboard.static', filename='clock.js') }}"></script>
   <script defer src="{{ url_for('dashboard.static', filename='modules.js') }}"></script>
+  <script defer src="{{ url_for('dashboard.static', filename='data.js') }}"></script>
 </head>
 <body>
 <main class="mirror" aria-label="Magic Mirror V2 dashboard">
@@ -20,7 +21,17 @@
   {% if 'weather' in settings.enabled_modules %}
   <section class="weather-region module" id="module-weather" data-module="weather" aria-labelledby="weather-title">
     <h2 id="weather-title">Weather</h2>
+    <div class="weather-current" data-role="weather-current" hidden>
+      <span class="weather-primary" data-role="temperature-c"></span>
+      <span class="weather-divider" aria-hidden="true">/</span>
+      <span class="weather-secondary" data-role="temperature-f"></span>
+    </div>
     <p class="module-status" data-role="status">Not connected</p>
+    <div class="weather-metrics" data-role="weather-metrics" hidden>
+      <p><span class="metric-label">High</span><span class="metric-primary" data-role="high-c"></span><span class="metric-divider" aria-hidden="true">/</span><span class="metric-secondary" data-role="high-f"></span></p>
+      <p><span class="metric-label">Low</span><span class="metric-primary" data-role="low-c"></span><span class="metric-divider" aria-hidden="true">/</span><span class="metric-secondary" data-role="low-f"></span></p>
+      <p data-role="feels-row"><span class="metric-label">Feels like</span><span class="metric-primary" data-role="feels_like-c"></span><span class="metric-divider" aria-hidden="true">/</span><span class="metric-secondary" data-role="feels_like-f"></span></p>
+    </div>
     <p class="module-detail" data-role="detail">Current conditions and forecast will appear here.</p>
   </section>
   {% endif %}
@@ -31,6 +42,7 @@
       <h2 id="news-title">News</h2>
       <p class="module-status" data-role="status">Not connected</p>
       <p class="module-detail" data-role="detail">Headlines will appear here.</p>
+      <div class="news-items" data-role="headlines"></div>
     </section>
     {% endif %}
   </div>

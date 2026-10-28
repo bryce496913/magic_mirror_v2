@@ -13,3 +13,9 @@ def home():
 @dashboard.get("/health")
 def health():
     return jsonify(status="healthy")
+
+
+@dashboard.get("/api/dashboard")
+def dashboard_data():
+    data = current_app.config["MIRROR_DATA"]
+    return jsonify(modules=data.snapshot() if data is not None else {})
