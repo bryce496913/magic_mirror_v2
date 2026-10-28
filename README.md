@@ -73,6 +73,7 @@ The expected response is `{"status":"healthy"}`. Stop the foreground server with
 | `MIRROR_NEWS_FEEDS` | blank | Up to five comma-separated HTTPS or HTTP RSS/Atom URLs. |
 | `MIRROR_PIHOLE_URL` | `http://127.0.0.1` | Pi-hole v6 API base address on the same Pi. |
 | `MIRROR_PIHOLE_PASSWORD_FILE` | blank | Optional absolute path to a local Pi-hole v6 application password file. |
+| `MIRROR_PIHOLE_CA_CERT` | blank | Optional absolute path to a readable trusted CA certificate file for Pi-hole HTTPS. Requires an HTTPS Pi-hole URL. |
 | `MIRROR_SYSTEM_INTERVAL` | `15` | System refresh seconds, minimum 5. |
 | `MIRROR_WEATHER_INTERVAL` | `900` | Weather refresh seconds, minimum 300. |
 | `MIRROR_NEWS_INTERVAL` | `1800` | News refresh seconds, minimum 300. |
@@ -83,6 +84,8 @@ The clock uses the Pi's configured local timezone through Chromium. Change the P
 On shutdown, all workers receive a stop signal and no new refresh starts. The application waits up to seven seconds in total for active work. If a bounded network call lasts longer, the coordinator reports that workers are still alive and retains their handles; another `stop()` can wait again, and `start()` refuses to create replacements until those workers finish. When the foreground Flask process exits, any remaining daemon worker ends with that process. This does not alter Pi-hole or other services.
 
 Open-Meteo supplies current temperature, condition, high/low, feels-like when available, and tomorrow's short forecast. Each weather reading shows Celsius in larger white type followed by Fahrenheit in smaller gray type. Both values are calculated from the same response; no second API request is made. Existing JSON fields (`temperature`, `high`, `low`, `feels_like`, and `unit`) keep their configured source units; additional `_c` and `_f` fields supply the dual display. RSS/Atom feeds supply at most three deduplicated titles with publisher and publication time when available. News text is inserted as text, and article scripts or images are never loaded. The Pi-hole provider implements the v6 `/api/stats/summary`, `/api/dns/blocking`, and session authentication contract documented by Pi-hole; it only reads statistics and blocking status after authentication. The system provider reads psutil and Linux thermal data without privilege. CPU temperature shows an unavailable marker if no sensor is present.
+
+For a Pi-hole installation with a private CA, set `MIRROR_PIHOLE_URL=https://pi.hole` and point `MIRROR_PIHOLE_CA_CERT` to the absolute path of the trusted CA certificate file in the ignored local `.env`. Keep the CA certificate and application password in a private directory such as `.private/` (ignored by Git) or outside the repository, with permissions limited to the application user. The CA file must exist and be readable at startup. Pi-hole authentication, statistics, and blocking requests then verify HTTPS against that CA; an invalid certificate or hostname causes the Pi-hole module to become unavailable or stale. Without a custom CA, requests use the normal certificate trust store. Weather and news continue using their own normal certificate trust settings.
 
 For the hardware validation steps, including a private Pi-hole credential setup procedure and version check, see [Pass 3 Raspberry Pi validation](docs/PASS3_PI_VALIDATION.md).
 
@@ -105,6 +108,7 @@ Verify the live clock advances across a minute boundary without refresh, the dat
 - `ModuleNotFoundError` usually means dependencies were not installed into `.venv` or the wrong Python interpreter was used. Repeat the installation command and launch through `scripts/run_pi.sh`.
 - If Chromium cannot reach the page, verify `/health` locally first and make sure Chromium runs on the same Pi. Localhost binding intentionally does not expose the server to other devices.
 - If dependency installation fails, verify Python is at least 3.11, PyPI is reachable, and `.venv/bin/python -m pip` is being used.
+- If Pi-hole HTTPS is unavailable, check that `MIRROR_PIHOLE_CA_CERT` is an absolute path to the trusted CA certificate, readable by the Flask user, and that the certificate covers the hostname in `MIRROR_PIHOLE_URL`. Do not turn off certificate verification.
 
 ## Raspberry Pi acceptance checklist
 

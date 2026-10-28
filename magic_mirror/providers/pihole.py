@@ -22,7 +22,8 @@ class PiHoleProvider:
             raise ProviderUnavailable("Pi-hole authentication unavailable") from exc
         if not password:
             raise ProviderUnavailable("Pi-hole authentication unavailable")
-        response = requests.post(settings.pihole_url + "/api/auth", json={"password": password}, timeout=(3, 5))
+        response = requests.post(settings.pihole_url + "/api/auth", json={"password": password},
+                                 timeout=(3, 5), verify=settings.pihole_ca_cert or True)
         if response.status_code in {401, 403}:
             raise ProviderUnavailable("Pi-hole authentication failed")
         response.raise_for_status()
@@ -42,12 +43,14 @@ class PiHoleProvider:
         if settings.pihole_password_file and not self._sid:
             self._authenticate(settings)
         headers = {"X-FTL-SID": self._sid} if self._sid else {}
-        summary = requests.get(settings.pihole_url + "/api/stats/summary", headers=headers, timeout=(3, 5))
+        summary = requests.get(settings.pihole_url + "/api/stats/summary", headers=headers,
+                               timeout=(3, 5), verify=settings.pihole_ca_cert or True)
         if summary.status_code in {401, 403}:
             self._sid = None
             raise ProviderUnavailable("Pi-hole authentication required")
         summary.raise_for_status()
-        blocking = requests.get(settings.pihole_url + "/api/dns/blocking", headers=headers, timeout=(3, 5))
+        blocking = requests.get(settings.pihole_url + "/api/dns/blocking", headers=headers,
+                                timeout=(3, 5), verify=settings.pihole_ca_cert or True)
         if blocking.status_code in {401, 403}:
             self._sid = None
             raise ProviderUnavailable("Pi-hole authentication required")

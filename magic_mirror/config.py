@@ -3,6 +3,7 @@
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlparse
 
@@ -46,6 +47,7 @@ class Settings:
     news_feeds: tuple[str, ...] = ()
     pihole_url: str = "http://127.0.0.1"
     pihole_password_file: str = ""
+    pihole_ca_cert: str = ""
     system_interval: int = 15
     weather_interval: int = 900
     news_interval: int = 1800
@@ -112,10 +114,24 @@ class Settings:
             raise ConfigurationError("MIRROR_PIHOLE_PASSWORD_FILE must be an absolute path")
         if password_file and urlparse(pihole_url).scheme != "https" and urlparse(pihole_url).hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise ConfigurationError("Pi-hole authentication requires HTTPS or a loopback URL")
+        ca_cert = values.get("MIRROR_PIHOLE_CA_CERT", "").strip()
+        if ca_cert:
+            if not os.path.isabs(ca_cert):
+                raise ConfigurationError("MIRROR_PIHOLE_CA_CERT must be an absolute path")
+            if urlparse(pihole_url).scheme != "https":
+                raise ConfigurationError("MIRROR_PIHOLE_CA_CERT requires an HTTPS Pi-hole URL")
+            if not Path(ca_cert).is_file():
+                raise ConfigurationError("MIRROR_PIHOLE_CA_CERT must point to a readable file")
+            try:
+                with open(ca_cert, "rb"):
+                    pass
+            except OSError as exc:
+                raise ConfigurationError("MIRROR_PIHOLE_CA_CERT must point to a readable file") from exc
         return cls(host=host, port=port, log_level=level, clock_format=clock_format,
                    display_scale=display_scale, enabled_modules=modules,
                    weather_latitude=latitude, weather_longitude=longitude, weather_unit=unit,
                    news_feeds=feeds, pihole_url=pihole_url, pihole_password_file=password_file,
+                   pihole_ca_cert=ca_cert,
                    system_interval=_interval(values, "MIRROR_SYSTEM_INTERVAL", 15, 5),
                    weather_interval=_interval(values, "MIRROR_WEATHER_INTERVAL", 900, 300),
                    news_interval=_interval(values, "MIRROR_NEWS_INTERVAL", 1800, 300),

@@ -38,6 +38,36 @@ def test_live_module_configuration():
     assert settings.pihole_password_file == "/tmp/local-password"
 
 
+def test_pihole_ca_certificate_path(tmp_path):
+    ca_cert = tmp_path / "local-ca.crt"
+    ca_cert.write_text("test fixture only")
+    settings = Settings.from_env({"MIRROR_PIHOLE_URL": "https://pi.hole",
+                                  "MIRROR_PIHOLE_CA_CERT": str(ca_cert)})
+    assert settings.pihole_ca_cert == str(ca_cert)
+
+
+@pytest.mark.parametrize("ca_path", ["relative-ca.crt", "/nonexistent/mirror-ca.crt"])
+def test_invalid_pihole_ca_certificate_path(ca_path):
+    with pytest.raises(ConfigurationError, match="MIRROR_PIHOLE_CA_CERT"):
+        Settings.from_env({"MIRROR_PIHOLE_URL": "https://pi.hole",
+                           "MIRROR_PIHOLE_CA_CERT": ca_path})
+
+
+def test_pihole_ca_certificate_must_be_readable_https_file(tmp_path, monkeypatch):
+    with pytest.raises(ConfigurationError, match="MIRROR_PIHOLE_CA_CERT"):
+        Settings.from_env({"MIRROR_PIHOLE_URL": "https://pi.hole",
+                           "MIRROR_PIHOLE_CA_CERT": str(tmp_path)})
+    ca_cert = tmp_path / "local-ca.crt"
+    ca_cert.write_text("test fixture only")
+    with pytest.raises(ConfigurationError, match="requires an HTTPS"):
+        Settings.from_env({"MIRROR_PIHOLE_CA_CERT": str(ca_cert)})
+    with monkeypatch.context() as patch:
+        patch.setattr("builtins.open", lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError()))
+        with pytest.raises(ConfigurationError, match="readable file"):
+            Settings.from_env({"MIRROR_PIHOLE_URL": "https://pi.hole",
+                               "MIRROR_PIHOLE_CA_CERT": str(ca_cert)})
+
+
 @pytest.mark.parametrize(
     "values",
     [

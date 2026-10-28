@@ -58,6 +58,8 @@ chmod 600 "$HOME/.config/magic-mirror-v2/pihole-password"
 
 Set `MIRROR_PIHOLE_PASSWORD_FILE` in `.env` to that file's **absolute** path, then restart Flask. Do not paste the password into `.env`, a URL, a command argument, Git, or a test report. Check that the Pi-hole region shows blocking state, total queries, blocked queries, and blocked percentage. A failed authentication should show unavailable or stale without affecting other regions. The code uses the session ID only in an HTTP header and does not expose it to the browser. Authentication over plain HTTP is accepted only for loopback URLs; use HTTPS for a nonlocal Pi-hole endpoint.
 
+For the tested Pi-hole v6 HTTPS setup, set `MIRROR_PIHOLE_URL=https://pi.hole` and `MIRROR_PIHOLE_CA_CERT` in the ignored local `.env` to the **absolute** path of the trusted Pi-hole CA certificate. Keep that certificate and the application password in private files; `.private/` is ignored by Git if you choose to store them under this checkout. Confirm the Flask user can read both files and that the certificate validates the `pi.hole` hostname. Restart Flask, verify the Pi-hole region populates, then confirm that an invalid or unreadable CA path produces a clear startup configuration error. An untrusted certificate or hostname mismatch should leave only the Pi-hole module unavailable or stale. Restore the valid CA path before continuing. No system-wide trust configuration or disabled certificate verification is needed.
+
 ## E. Combined dashboard reliability
 
 Open `http://127.0.0.1:5000/` in Chromium on the Pi, or use a temporary manual kiosk window:

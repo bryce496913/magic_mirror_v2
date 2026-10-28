@@ -12,6 +12,7 @@ htmlcov/
 logs/
 runtime/
 data/private/
+.private/
 *.pem
 *.key
 credentials.json

@@ -149,6 +149,7 @@ def test_pihole_v6_success_and_auth_failure(monkeypatch, tmp_path):
                     "queries_blocked": 25, "blocked_percent": 25.0}
     assert calls[0][1]["json"] == {"password": "test-only-password"}
     assert calls[1][1]["headers"] == {"X-FTL-SID": "test-sid"}
+    assert all(kwargs["verify"] is True for _, kwargs in calls)
     assert all("test-only-password" not in url for url, _ in calls)
     monkeypatch.setattr(pihole.requests, "post", lambda *_args, **_kwargs: Response(status=401))
     with pytest.raises(ProviderUnavailable, match="authentication failed"):
@@ -160,3 +161,72 @@ def test_pihole_connection_failure(monkeypatch):
     monkeypatch.setattr(pihole.requests, "get", lambda *_args, **_kwargs: (_ for _ in ()).throw(requests.ConnectionError()))
     with pytest.raises(requests.ConnectionError):
         PiHoleProvider().read(Settings())
+
+
+def test_pihole_custom_ca_verifies_auth_and_both_reads(monkeypatch, tmp_path):
+    from magic_mirror.providers import pihole
+    password_file = tmp_path / "password"
+    password_file.write_text("test-only-password")
+    ca_cert = tmp_path / "local-ca.crt"
+    ca_cert.write_text("test fixture only")
+    settings = Settings.from_env({"MIRROR_PIHOLE_URL": "https://pi.hole",
+                                  "MIRROR_PIHOLE_PASSWORD_FILE": str(password_file),
+                                  "MIRROR_PIHOLE_CA_CERT": str(ca_cert)})
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response({"session": {"valid": True, "sid": "test-sid", "validity": 300}})
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        if url.endswith("/summary"):
+            return Response({"queries": {"total": 100, "blocked": 25}})
+        return Response({"blocking": "enabled"})
+
+    monkeypatch.setattr(pihole.requests, "post", post)
+    monkeypatch.setattr(pihole.requests, "get", get)
+    assert PiHoleProvider().read(settings)["blocking_enabled"] is True
+    assert [url for url, _ in calls] == ["https://pi.hole/api/auth",
+                                        "https://pi.hole/api/stats/summary",
+                                        "https://pi.hole/api/dns/blocking"]
+    assert all(kwargs["verify"] == str(ca_cert) for _, kwargs in calls)
+    assert all(kwargs["timeout"] == (3, 5) for _, kwargs in calls)
+
+
+def test_pihole_certificate_failure_is_not_bypassed(monkeypatch, tmp_path):
+    from magic_mirror.providers import pihole
+    ca_cert = tmp_path / "local-ca.crt"
+    ca_cert.write_text("test fixture only")
+    def get(_url, **kwargs):
+        assert kwargs["verify"] == str(ca_cert)
+        raise requests.exceptions.SSLError("certificate verification failed")
+
+    monkeypatch.setattr(pihole.requests, "get", get)
+    with pytest.raises(requests.exceptions.SSLError, match="certificate verification failed"):
+        PiHoleProvider().read(Settings(pihole_url="https://pi.hole", pihole_ca_cert=str(ca_cert)))
+
+
+def test_pihole_ca_does_not_change_weather_or_news_trust(monkeypatch, tmp_path):
+    from magic_mirror.providers import pihole, weather, news
+    ca_cert = tmp_path / "local-ca.crt"
+    ca_cert.write_text("test fixture only")
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        if url.endswith("/api/stats/summary"):
+            return Response({"queries": {"total": 1, "blocked": 0}})
+        if url.endswith("/api/dns/blocking"):
+            return Response({"blocking": "enabled"})
+        if url == weather.API_URL:
+            return Response({"current": {"temperature_2m": 11, "weather_code": 0},
+                             "daily": {"temperature_2m_max": [12, 13],
+                                       "temperature_2m_min": [5, 6], "weather_code": [0, 0]}})
+        return Response(content=b"<rss><channel><title>Test</title><item><title>One</title></item></channel></rss>")
+
+    monkeypatch.setattr(pihole.requests, "get", get)
+    PiHoleProvider().read(Settings(pihole_url="https://pi.hole", pihole_ca_cert=str(ca_cert)))
+    read_weather(Settings(weather_latitude=10, weather_longitude=20))
+    read_news(Settings(news_feeds=("https://example.com/rss",)))
+    assert [kwargs.get("verify") for _, kwargs in calls] == [str(ca_cert), str(ca_cert), None, None]
