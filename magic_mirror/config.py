@@ -1,6 +1,7 @@
 """Environment configuration with safe development defaults."""
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,11 +27,31 @@ def _led_pin(values: Mapping[str, str], name: str, default: int) -> int:
     return pin
 
 
-def _led_bool(values: Mapping[str, str], name: str, default: bool) -> bool:
+def _bool(values: Mapping[str, str], name: str, default: bool) -> bool:
     value = values.get(name, "true" if default else "false").strip().lower()
     if value not in {"true", "false"}:
         raise ConfigurationError(f"{name} must be true or false")
     return value == "true"
+
+
+def _audio_int(values: Mapping[str, str], name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(values.get(name, str(default)))
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be between {low} and {high}") from exc
+    if not low <= value <= high:
+        raise ConfigurationError(f"{name} must be between {low} and {high}")
+    return value
+
+
+def _audio_float(values: Mapping[str, str], name: str, default: float, low: float, high: float) -> float:
+    try:
+        value = float(values.get(name, str(default)))
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be between {low} and {high}") from exc
+    if not math.isfinite(value) or not low <= value <= high:
+        raise ConfigurationError(f"{name} must be between {low} and {high}")
+    return value
 
 
 def _interval(values: Mapping[str, str], name: str, default: int, minimum: int) -> int:
@@ -76,6 +97,19 @@ class Settings:
     led_blue_pin: int = 24
     led_active_high: bool = True
     led_initial_state: str = "off"
+    audio_enabled: bool = False
+    audio_input_device: str = "USB PnP Sound Device"
+    audio_expected_input_source: str = ""
+    audio_output_device: str = "MAX98357A"
+    audio_capture_rate: int = 48000
+    audio_playback_rate: int = 48000
+    audio_capture_channels: int = 1
+    audio_playback_channels: int = 1
+    audio_buffer_duration: float = 0.1
+    audio_frame_format: str = "int16"
+    audio_playback_gain: float = 1.0
+    audio_max_playback_level: float = 1.0
+    audio_timeout: float = 5.0
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "Settings":
@@ -159,6 +193,17 @@ class Settings:
         led_initial_state = values.get("MIRROR_LED_INITIAL_STATE", "off").strip().lower()
         if led_initial_state not in LED_STATES:
             raise ConfigurationError("MIRROR_LED_INITIAL_STATE must be idle, listening, responding, or off")
+        audio_input = values.get("MIRROR_AUDIO_INPUT_DEVICE", "USB PnP Sound Device").strip()
+        audio_output = values.get("MIRROR_AUDIO_OUTPUT_DEVICE", "MAX98357A").strip()
+        expected_source = values.get("MIRROR_AUDIO_EXPECTED_INPUT_SOURCE", "").strip()
+        if any(not name or len(name) > 120 or any(char in name for char in "\r\n\x00")
+               for name in (audio_input, audio_output)):
+            raise ConfigurationError("Audio device selectors must be nonempty single-line names")
+        if len(expected_source) > 200 or any(char in expected_source for char in "\r\n\x00"):
+            raise ConfigurationError("MIRROR_AUDIO_EXPECTED_INPUT_SOURCE must be a single PipeWire node name")
+        audio_format = values.get("MIRROR_AUDIO_FRAME_FORMAT", "int16").strip().lower()
+        if audio_format not in {"int16", "float32"}:
+            raise ConfigurationError("MIRROR_AUDIO_FRAME_FORMAT must be int16 or float32")
         return cls(host=host, port=port, log_level=level, clock_format=clock_format,
                    display_scale=display_scale, enabled_modules=modules,
                    weather_latitude=latitude, weather_longitude=longitude, weather_unit=unit,
@@ -168,10 +213,22 @@ class Settings:
                    weather_interval=_interval(values, "MIRROR_WEATHER_INTERVAL", 900, 300),
                    news_interval=_interval(values, "MIRROR_NEWS_INTERVAL", 1800, 300),
                    pihole_interval=_interval(values, "MIRROR_PIHOLE_INTERVAL", 60, 15),
-                   led_enabled=_led_bool(values, "MIRROR_LED_ENABLED", False),
+                   led_enabled=_bool(values, "MIRROR_LED_ENABLED", False),
                    led_red_pin=led_pins[0], led_green_pin=led_pins[1], led_blue_pin=led_pins[2],
-                   led_active_high=_led_bool(values, "MIRROR_LED_ACTIVE_HIGH", True),
-                   led_initial_state=led_initial_state)
+                   led_active_high=_bool(values, "MIRROR_LED_ACTIVE_HIGH", True),
+                   led_initial_state=led_initial_state,
+                   audio_enabled=_bool(values, "MIRROR_AUDIO_ENABLED", False),
+                   audio_input_device=audio_input, audio_expected_input_source=expected_source,
+                   audio_output_device=audio_output,
+                   audio_capture_rate=_audio_int(values, "MIRROR_AUDIO_CAPTURE_RATE", 48000, 8000, 96000),
+                   audio_playback_rate=_audio_int(values, "MIRROR_AUDIO_PLAYBACK_RATE", 48000, 8000, 96000),
+                   audio_capture_channels=_audio_int(values, "MIRROR_AUDIO_CAPTURE_CHANNELS", 1, 1, 2),
+                   audio_playback_channels=_audio_int(values, "MIRROR_AUDIO_PLAYBACK_CHANNELS", 1, 1, 2),
+                   audio_buffer_duration=_audio_float(values, "MIRROR_AUDIO_BUFFER_DURATION", 0.1, 0.02, 1.0),
+                   audio_frame_format=audio_format,
+                   audio_playback_gain=_audio_float(values, "MIRROR_AUDIO_PLAYBACK_GAIN", 1.0, 0.0, 4.0),
+                   audio_max_playback_level=_audio_float(values, "MIRROR_AUDIO_MAX_PLAYBACK_LEVEL", 1.0, 0.1, 1.0),
+                   audio_timeout=_audio_float(values, "MIRROR_AUDIO_TIMEOUT", 5.0, 0.1, 30.0))
 
 
 def configure_logging(level: str) -> None:

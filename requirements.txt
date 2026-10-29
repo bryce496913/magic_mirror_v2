@@ -1,6 +1,7 @@
 # Exact versions for Python 3.11+ on Debian 12 and development machines.
 blinker==1.9.0
 certifi==2026.10.23
+cffi==2.0.0
 charset-normalizer==3.5.2
 click==8.3.0
 colorzero==2.0
@@ -13,13 +14,16 @@ itsdangerous==2.2.0
 Jinja2==3.1.6
 lgpio==0.2.2.0
 MarkupSafe==3.0.3
+numpy==2.3.4
 packaging==25.0
 pluggy==1.6.0
 psutil==7.1.1
+pycparser==2.23
 Pygments==2.19.2
 pytest==8.4.2
 python-dotenv==1.1.1
 requests==2.32.5
 setuptools==84.2.1
+sounddevice==0.5.6
 urllib3==2.8.0
 Werkzeug==3.1.3
