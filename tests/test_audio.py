@@ -314,6 +314,19 @@ def test_competing_capture_and_playback_owners_and_failed_open_recovery():
     second.close()
 
 
+def test_playback_start_primes_first_callback_and_tracks_played_frames():
+    backend = FakeBackend()
+    audio = manager(backend)
+    initial = np.array([[100], [200], [300]], dtype=np.int16)
+    audio.playback.start(initial)
+    assert np.array_equal(backend.outputs[-1].output(3), initial)
+    assert audio.playback.played_frames() == 3
+    audio.playback.stop()
+    audio.playback.start()
+    assert audio.playback.played_frames() == 0
+    audio.close()
+
+
 def test_playback_queue_drain_cancel_and_silence():
     backend = FakeBackend()
     audio = manager(backend)

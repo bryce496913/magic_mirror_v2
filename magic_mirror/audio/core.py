@@ -278,6 +278,7 @@ class AudioPlayback:
         self._stop = Event()
         self._queue = deque()
         self._queued_frames = 0
+        self._played_frames = 0
         self._stream = None
         self._error = None
         self.device = None
@@ -293,7 +294,7 @@ class AudioPlayback:
             if AudioPlayback._claim_owner is self:
                 AudioPlayback._claim_owner = None
 
-    def start(self):
+    def start(self, initial_pcm=None):
         with self._lock:
             if self._stream is not None:
                 return False
@@ -309,6 +310,18 @@ class AudioPlayback:
                 with self._condition:
                     self._queue.clear()
                     self._queued_frames = 0
+                    self._played_frames = 0
+
+                block = max(1, round(settings.audio_playback_rate * settings.audio_buffer_duration))
+                if initial_pcm is not None:
+                    initial = playback_gain(initial_pcm, settings.audio_frame_format,
+                                            settings.audio_playback_channels,
+                                            settings.audio_playback_gain, settings.audio_max_playback_level)
+                    if len(initial) > block * 8:
+                        raise AudioError("Initial speaker audio exceeds bounded queue capacity")
+                    with self._condition:
+                        self._queue.append(initial)
+                        self._queued_frames = len(initial)
 
                 def callback(outdata, frames, _time, status):
                     if status:
@@ -327,13 +340,14 @@ class AudioPlayback:
                             else:
                                 self._queue[0] = chunk[count:]
                             self._queued_frames -= count
+                            self._played_frames += count
                             offset += count
                         self._condition.notify_all()
 
                 stream = self.manager.backend.OutputStream(
                     device=self.device.index, channels=settings.audio_playback_channels,
                     samplerate=settings.audio_playback_rate, dtype=settings.audio_frame_format,
-                    blocksize=max(1, round(settings.audio_playback_rate * settings.audio_buffer_duration)),
+                    blocksize=block,
                     callback=callback)
                 self._stream = stream
                 stream.start()
@@ -414,6 +428,11 @@ class AudioPlayback:
                 self._condition.wait(timeout=wait)
             if self._error:
                 raise AudioError(self._error)
+
+    def played_frames(self):
+        """Number of actual PCM frames removed from the playback queue."""
+        with self._condition:
+            return self._played_frames
 
     def stop(self):
         with self._lock:
