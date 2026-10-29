@@ -14,7 +14,7 @@ import psutil
 from ..audio import AudioError, AudioManager
 from ..config import Settings, WAKE_MODEL_FILES, WAKE_MODEL_STEM
 from .client import RealtimeError
-from .events import ConversationEvent
+from .events import ConversationEvent, PlaybackAction, PlaybackEvent
 from .voice import VoiceConversation, VoiceError
 
 READ_MS = 100
@@ -155,7 +155,9 @@ class WakeController:
                  sleep: Callable = asyncio.sleep,
                  process: psutil.Process | None = None,
                  on_state: Callable[[WakeState], None] | None = None,
-                 on_metrics: Callable[[WakeMetrics], None] | None = None):
+                 on_metrics: Callable[[WakeMetrics], None] | None = None,
+                 on_voice_event: Callable[[ConversationEvent], None] | None = None,
+                 on_playback: Callable[[PlaybackEvent], None] | None = None):
         self.settings = settings
         self.audio = audio or AudioManager(settings, enabled=True)
         self.detector_factory = detector_factory
@@ -165,6 +167,8 @@ class WakeController:
         self.process = process or psutil.Process()
         self.on_state = on_state
         self.on_metrics = on_metrics
+        self.on_voice_event = on_voice_event
+        self.on_playback = on_playback
         self.state = WakeState.STOPPED
         self.stop_event = asyncio.Event()
         self.detector = None
@@ -206,6 +210,8 @@ class WakeController:
             self.voice.stop_event.set()
 
     def _voice_event(self, event: ConversationEvent) -> None:
+        if self.on_voice_event:
+            self.on_voice_event(event)
         if event.role == "user" and event.final and event.text and (
                 " ".join(event.text.strip().lower().rstrip(".!?").split()) in
                 {"goodbye", "go to sleep", "stop listening"}):
@@ -217,7 +223,11 @@ class WakeController:
             self._state(WakeState.PROCESSING)
         elif event.kind in {"response.created", "response.output_audio.delta"}:
             self._state(WakeState.RESPONDING)
-        elif event.kind == "response.done" and event.status == "completed":
+
+    def _playback_event(self, event: PlaybackEvent) -> None:
+        if self.on_playback:
+            self.on_playback(event)
+        if event.action in {PlaybackAction.COMPLETED, PlaybackAction.INTERRUPTED} and not self.stop_event.is_set():
             self._state(WakeState.LISTENING)
 
     async def _activate(self) -> None:
@@ -250,6 +260,7 @@ class WakeController:
                 self.settings, audio=self.audio, before_capture=handoff,
                 first_speech_seconds=self.settings.wake_first_speech_seconds,
                 on_event=self._voice_event, on_ready=lambda: self._state(WakeState.LISTENING),
+                on_playback=self._playback_event,
             )
         except Exception:
             drain_stop.set()

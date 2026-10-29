@@ -17,6 +17,18 @@ class ConversationState(StrEnum):
     ERROR = "error"
 
 
+class PlaybackAction(StrEnum):
+    STARTED = "started"
+    COMPLETED = "completed"
+    INTERRUPTED = "interrupted"
+
+
+@dataclass(frozen=True)
+class PlaybackEvent:
+    action: PlaybackAction
+    response_id: str
+
+
 @dataclass(frozen=True)
 class ConversationEvent:
     kind: str
