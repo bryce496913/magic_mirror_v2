@@ -14,7 +14,7 @@ Preview captured in headless Chromium during development. Check contrast and spa
 - No root access to run the application
 - `libportaudio2` on the Pi for microphone and speaker tests (check with `dpkg-query -W libportaudio2`)
 
-Runtime libraries are Flask, python-dotenv, psutil, requests, defusedxml, gpiozero, lgpio, sounddevice, and NumPy. `pytest` is used for development. `requirements.txt` pins direct and transitive Python packages to tested versions; it does not install system packages. GPIO and audio streams remain closed until explicitly requested.
+Runtime libraries are Flask, python-dotenv, psutil, requests, defusedxml, gpiozero, lgpio, sounddevice, NumPy, and websockets. `pytest` is used for development. `requirements.txt` pins direct and transitive Python packages to tested versions; it does not install system packages. GPIO and audio streams remain closed until explicitly requested.
 
 ## Project layout
 
@@ -27,6 +27,7 @@ magic_mirror/
   providers/            read-only system, weather, news, and Pi-hole sources
   hardware/             RGB LED controller and standalone hardware test command
   audio/                device selection, bounded capture/playback, PCM gain, test CLI
+  assistant/            opt-in Realtime session, typed event tracker, offline-first CLI
   dashboard/            routes, template, local CSS, and small JavaScript modules
 tests/                  hardware-free application and configuration tests
 scripts/run_pi.sh       manual Raspberry Pi launcher
@@ -34,7 +35,7 @@ scripts/run_pi.sh       manual Raspberry Pi launcher
 requirements.txt        pinned Python dependencies
 ```
 
-Future dashboard features belong under `magic_mirror/dashboard/`. The assistant integration can be added separately when its requirements are defined.
+Future dashboard features belong under `magic_mirror/dashboard/`. The Realtime transport is separate from Flask, the dashboard, and audio devices.
 
 ## Raspberry Pi installation
 
@@ -96,6 +97,16 @@ The expected response is `{"status":"healthy"}`. Stop the foreground server with
 | `MIRROR_AUDIO_PLAYBACK_GAIN` | `1.0` | Software speaker gain, 0–4. The tested Pi used `1.4` locally; `2.0` was louder but audibly distorted. |
 | `MIRROR_AUDIO_MAX_PLAYBACK_LEVEL` | `1.0` | Peak ceiling, 0.1–1.0 of full scale; samples saturate before integer conversion. |
 | `MIRROR_AUDIO_TIMEOUT` | `5.0` | Seconds, 0.1–30, for waiting on capture, playback queue space, and drain. |
+| `OPENAI_API_KEY` | blank | Server-side OpenAI key in ignored local `.env`; never sent to Chromium. Required only for explicit live Realtime CLI connection. |
+| `MIRROR_REALTIME_MODEL` | `gpt-realtime-2.1-mini` | Explicit Realtime model ID. Unavailable models fail; no cost-tier fallback. |
+| `MIRROR_REALTIME_MAX_SESSION_SECONDS` | `900` | Hard session lifetime, 1–3600 seconds. |
+| `MIRROR_REALTIME_IDLE_SECONDS` | `60` | No-event idle cutoff, 1–3600 seconds and no longer than session lifetime. |
+| `MIRROR_REALTIME_MAX_RESPONSE_SECONDS` | `90` | Per-response cutoff, 1–3600 seconds and no longer than session lifetime. |
+| `MIRROR_REALTIME_CONNECT_TIMEOUT` | `10` | Connect, send, and acknowledgment timeout, 1–60 seconds. |
+| `MIRROR_REALTIME_RETRY_LIMIT` | `2` | Additional transient connection attempts, 0–5. Authentication and protocol errors are not retried. |
+| `MIRROR_REALTIME_BACKOFF_SECONDS` | `1.0` | Initial exponential retry delay, 0.1–10 seconds. |
+
+Pass 6A adds an explicit OpenAI Realtime connection foundation. Flask startup and page views never open an OpenAI connection, microphone, or speaker, and the assistant display stays a placeholder. The safe offline check is `.venv/bin/python -m magic_mirror.assistant.realtime_test`; live validation requires `--connect` and a local `OPENAI_API_KEY`. See [Pass 6A Realtime validation and protocol](docs/PASS6A_REALTIME.md) for exact Pi commands, event handling, cost assumptions, and limits.
 
 The clock uses the Pi's configured local timezone through Chromium. Change the Pi's system timezone if the clock shows the wrong local time, then refresh Chromium. The clock checks the current time at minute boundaries and refreshes when the page becomes visible again. The browser requests one cached `/api/dashboard` JSON snapshot every 15 seconds while visible. Up to four background workers, one per enabled data provider, run on independent schedules; they never run in page routes or overlap their own refreshes. Successful snapshots stay in memory until the process exits; failed refreshes retain last-known-good values with a stale label and a UTC last-success timestamp. The endpoint returns data only, never feed URLs, coordinates, passwords, or session IDs. No external HTTP requests occur during application initialization or page rendering.
 
