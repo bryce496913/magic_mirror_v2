@@ -1,0 +1,4 @@
+# Optional local wake detection; install with requirements.txt only when enabling.
+sherpa-onnx==2.0.1
+sherpa-onnx-core==2.0.1
+sentencepiece==0.2.2
