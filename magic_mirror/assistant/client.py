@@ -31,6 +31,7 @@ class RealtimeClient:
         self.last_activity: float | None = None
         self._watchdog: asyncio.Task[None] | None = None
         self._activity = asyncio.Event()
+        self._send_lock = asyncio.Lock()
         self._expiry_reason: str | None = None
 
     @property
@@ -107,10 +108,12 @@ class RealtimeClient:
         return event
 
     async def _send_raw(self, payload: dict[str, Any]) -> None:
-        if self.socket is None:
-            raise RealtimeError("Realtime session is disconnected")
         try:
-            await asyncio.wait_for(self.socket.send(json.dumps(payload)), self.settings.realtime_connect_timeout)
+            async with self._send_lock:
+                socket = self.socket
+                if socket is None:
+                    raise RealtimeError("Realtime session is disconnected")
+                await asyncio.wait_for(socket.send(json.dumps(payload)), self.settings.realtime_connect_timeout)
         except (TimeoutError, ConnectionClosed, OSError):
             await self.close()
             raise RealtimeError("Realtime send failed") from None

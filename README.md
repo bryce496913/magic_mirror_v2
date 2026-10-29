@@ -27,7 +27,7 @@ magic_mirror/
   providers/            read-only system, weather, news, and Pi-hole sources
   hardware/             RGB LED controller and standalone hardware test command
   audio/                device selection, bounded capture/playback, PCM gain, test CLI
-  assistant/            opt-in Realtime session, typed event tracker, offline-first CLI
+  assistant/            opt-in Realtime client, voice conversation, and local CLIs
   dashboard/            routes, template, local CSS, and small JavaScript modules
 tests/                  hardware-free application and configuration tests
 scripts/run_pi.sh       manual Raspberry Pi launcher
@@ -107,6 +107,8 @@ The expected response is `{"status":"healthy"}`. Stop the foreground server with
 | `MIRROR_REALTIME_BACKOFF_SECONDS` | `1.0` | Initial exponential retry delay, 0.1–10 seconds. |
 
 Pass 6A adds an explicit OpenAI Realtime connection foundation. Flask startup and page views never open an OpenAI connection, microphone, or speaker, and the assistant display stays a placeholder. The safe offline check is `.venv/bin/python -m magic_mirror.assistant.realtime_test`; live validation requires `--connect` and a local `OPENAI_API_KEY`. See [Pass 6A Realtime validation and protocol](docs/PASS6A_REALTIME.md) for exact Pi commands, event handling, cost assumptions, and limits.
+
+Pass 6B adds a manually started local voice conversation through the existing `AudioManager`. The command `.venv/bin/python -m magic_mirror.assistant.voice_cli` is offline; add `--start` to connect and open the selected microphone. The dashboard and Flask startup still never activate voice. On the tested Pi, select `pipewire` with its verified physical USB source, `MAX98357A` output, 48 kHz mono int16, and the locally tested `MIRROR_AUDIO_PLAYBACK_GAIN=1.4` in the ignored `.env`. The CLI converts audio to and from the Realtime 24 kHz mono PCM format, uses server VAD for turns, prints final transcripts locally, and stops after 60 seconds without speech or the configured maximum session duration. See [Pass 6B Pi voice validation](docs/PASS6B_PI_VALIDATION.md) for exact commands and acceptance checks.
 
 The clock uses the Pi's configured local timezone through Chromium. Change the Pi's system timezone if the clock shows the wrong local time, then refresh Chromium. The clock checks the current time at minute boundaries and refreshes when the page becomes visible again. The browser requests one cached `/api/dashboard` JSON snapshot every 15 seconds while visible. Up to four background workers, one per enabled data provider, run on independent schedules; they never run in page routes or overlap their own refreshes. Successful snapshots stay in memory until the process exits; failed refreshes retain last-known-good values with a stale label and a UTC last-success timestamp. The endpoint returns data only, never feed URLs, coordinates, passwords, or session IDs. No external HTTP requests occur during application initialization or page rendering.
 
