@@ -15,6 +15,9 @@ class ConfigurationError(ValueError):
 
 DASHBOARD_MODULES = ("weather", "news", "pihole", "system", "assistant")
 LED_STATES = ("idle", "listening", "responding", "off")
+WAKE_MODEL_STEM = "epoch-12-avg-2-chunk-16-left-64.int8.onnx"
+WAKE_MODEL_FILES = ("tokens.txt", "bpe.model", *(f"{part}-{WAKE_MODEL_STEM}"
+                                              for part in ("encoder", "decoder", "joiner")))
 
 
 def _led_pin(values: Mapping[str, str], name: str, default: int) -> int:
@@ -118,6 +121,12 @@ class Settings:
     realtime_connect_timeout: int = 10
     realtime_retry_limit: int = 2
     realtime_backoff_seconds: float = 1.0
+    wake_enabled: bool = False
+    wake_phrase: str = "magic mirror"
+    wake_model_dir: str = ""
+    wake_cooldown_seconds: float = 5.0
+    wake_first_speech_seconds: int = 8
+    wake_threshold: float = 0.35
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "Settings":
@@ -222,6 +231,18 @@ class Settings:
         response_seconds = _audio_int(values, "MIRROR_REALTIME_MAX_RESPONSE_SECONDS", 90, 1, 3600)
         if response_seconds > session_seconds:
             raise ConfigurationError("MIRROR_REALTIME_MAX_RESPONSE_SECONDS cannot exceed session duration")
+        wake_enabled = _bool(values, "MIRROR_WAKE_ENABLED", False)
+        wake_phrase = " ".join(values.get("MIRROR_WAKE_PHRASE", "magic mirror").strip().lower().split())
+        if (not 3 <= len(wake_phrase) <= 40 or len(wake_phrase.split()) > 5 or
+                any(ch not in "abcdefghijklmnopqrstuvwxyz " for ch in wake_phrase)):
+            raise ConfigurationError("MIRROR_WAKE_PHRASE must be 3-40 ASCII letters and spaces, at most five words")
+        wake_model_dir = values.get("MIRROR_WAKE_MODEL_DIR", "").strip()
+        if wake_enabled and (not os.path.isabs(wake_model_dir) or not Path(wake_model_dir).is_dir()):
+            raise ConfigurationError("MIRROR_WAKE_MODEL_DIR must be an existing absolute directory when wake is enabled")
+        if wake_model_dir and not os.path.isabs(wake_model_dir):
+            raise ConfigurationError("MIRROR_WAKE_MODEL_DIR must be an absolute directory path")
+        if wake_enabled and any(not (Path(wake_model_dir) / name).is_file() for name in WAKE_MODEL_FILES):
+            raise ConfigurationError("MIRROR_WAKE_MODEL_DIR is missing required English int8 model files")
         return cls(host=host, port=port, log_level=level, clock_format=clock_format,
                    display_scale=display_scale, enabled_modules=modules,
                    weather_latitude=latitude, weather_longitude=longitude, weather_unit=unit,
@@ -254,7 +275,11 @@ class Settings:
                    realtime_max_response_seconds=response_seconds,
                    realtime_connect_timeout=_audio_int(values, "MIRROR_REALTIME_CONNECT_TIMEOUT", 10, 1, 60),
                    realtime_retry_limit=_audio_int(values, "MIRROR_REALTIME_RETRY_LIMIT", 2, 0, 5),
-                   realtime_backoff_seconds=_audio_float(values, "MIRROR_REALTIME_BACKOFF_SECONDS", 1.0, 0.1, 10.0))
+                   realtime_backoff_seconds=_audio_float(values, "MIRROR_REALTIME_BACKOFF_SECONDS", 1.0, 0.1, 10.0),
+                   wake_enabled=wake_enabled, wake_phrase=wake_phrase, wake_model_dir=wake_model_dir,
+                   wake_cooldown_seconds=_audio_float(values, "MIRROR_WAKE_COOLDOWN_SECONDS", 5.0, 0.5, 30.0),
+                   wake_first_speech_seconds=_audio_int(values, "MIRROR_WAKE_FIRST_SPEECH_SECONDS", 8, 3, 60),
+                   wake_threshold=_audio_float(values, "MIRROR_WAKE_THRESHOLD", 0.35, 0.1, 0.9))
 
 
 def configure_logging(level: str) -> None:

@@ -4,7 +4,7 @@ import asyncio
 import base64
 import binascii
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -41,12 +41,20 @@ class VoiceConversation:
                  client: RealtimeClient | None = None,
                  on_transcript: Callable[[Transcript], None] | None = None,
                  on_latency: Callable[[float], None] | None = None,
+                 on_event: Callable[[ConversationEvent], None] | None = None,
+                 before_capture: Callable[[], Awaitable[None]] | None = None,
+                 on_ready: Callable[[], None] | None = None,
+                 first_speech_seconds: float | None = None,
                  clock: Callable[[], float] = time.monotonic):
         self.settings = settings
         self.audio = audio or AudioManager(settings, enabled=True)
         self.client = client or RealtimeClient(settings)
         self.on_transcript = on_transcript
         self.on_latency = on_latency
+        self.on_event = on_event
+        self.before_capture = before_capture
+        self.on_ready = on_ready
+        self.first_speech_seconds = first_speech_seconds
         self.clock = clock
         self.transcripts: dict[tuple[str, str, int], Transcript] = {}
         self.stop_event = asyncio.Event()
@@ -62,6 +70,7 @@ class VoiceConversation:
         self._last_speech = self.clock()
         self._speech_end: float | None = None
         self._first_audio_reported = False
+        self.heard_speech = False
         self._input_rate: StreamingPCM | None = None
         self._output_rate: StreamingPCM | None = None
         self._limiter = StreamingPeakLimiter(settings.audio_playback_gain, settings.audio_max_playback_level)
@@ -109,7 +118,12 @@ class VoiceConversation:
                         raise VoiceError("OpenAI voice session ID changed")
                     break
             await asyncio.to_thread(self.audio.selected, "output")
-            await asyncio.to_thread(self.audio.capture.start)
+            if self.before_capture is not None:
+                await self.before_capture()
+            if not await asyncio.to_thread(self.audio.capture.start):
+                raise VoiceError("Microphone was still active before voice capture")
+            if self.on_ready is not None:
+                self.on_ready()
             self._last_speech = self.clock()
             self._tasks = [asyncio.create_task(self._capture_loop()),
                            asyncio.create_task(self._receive_loop()),
@@ -145,7 +159,9 @@ class VoiceConversation:
 
     async def _silence_loop(self) -> None:
         while not self.stop_event.is_set():
-            if self.clock() - self._last_speech >= SILENCE_SECONDS:
+            silence_limit = (self.first_speech_seconds if not self.heard_speech and
+                             self.first_speech_seconds is not None else SILENCE_SECONDS)
+            if self.clock() - self._last_speech >= silence_limit:
                 self.stop_event.set()
                 return
             await asyncio.sleep(1)
@@ -208,8 +224,11 @@ class VoiceConversation:
         await self._interrupt_output(cancel_server=True)
 
     async def handle_event(self, event: ConversationEvent) -> None:
+        if self.on_event is not None:
+            self.on_event(event)
         kind = event.kind
         if kind == "input_audio_buffer.speech_started":
+            self.heard_speech = True
             self._last_speech = self.clock()
             if self._current_response:
                 await self._interrupt_output()

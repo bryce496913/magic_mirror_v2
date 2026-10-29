@@ -33,6 +33,7 @@ class FakeCapture:
             raise AudioError("duplicate capture")
         self.active = True
         self.starts += 1
+        return True
 
     def read_frames(self, count):
         time.sleep(0.002)
@@ -354,6 +355,16 @@ def test_silence_closes_session_without_response(monkeypatch):
         voice, audio, client, _, _ = make_voice()
         await voice.run()
         assert audio.closed and client.closed
+        assert not any(x["type"] == "response.create" for x in client.sent)
+    asyncio.run(scenario())
+
+
+def test_wake_false_activation_uses_short_first_speech_limit():
+    async def scenario():
+        voice, audio, client, _, _ = make_voice()
+        voice.first_speech_seconds = 0
+        await voice.run()
+        assert not voice.heard_speech and audio.closed and client.closed
         assert not any(x["type"] == "response.create" for x in client.sent)
     asyncio.run(scenario())
 
