@@ -12,7 +12,7 @@ import numpy as np
 from ..audio import AudioError, AudioManager
 from ..config import Settings
 from .client import RealtimeClient, RealtimeError
-from .events import ConversationEvent
+from .events import ConversationEvent, PlaybackAction, PlaybackEvent
 from .resample import StreamingPCM, StreamingPeakLimiter
 
 API_RATE = 24000
@@ -42,6 +42,7 @@ class VoiceConversation:
                  on_transcript: Callable[[Transcript], None] | None = None,
                  on_latency: Callable[[float], None] | None = None,
                  on_event: Callable[[ConversationEvent], None] | None = None,
+                 on_playback: Callable[[PlaybackEvent], None] | None = None,
                  before_capture: Callable[[], Awaitable[None]] | None = None,
                  on_ready: Callable[[], None] | None = None,
                  first_speech_seconds: float | None = None,
@@ -52,6 +53,7 @@ class VoiceConversation:
         self.on_transcript = on_transcript
         self.on_latency = on_latency
         self.on_event = on_event
+        self.on_playback = on_playback
         self.before_capture = before_capture
         self.on_ready = on_ready
         self.first_speech_seconds = first_speech_seconds
@@ -183,11 +185,15 @@ class VoiceConversation:
                         if self._current_response == response_id:
                             self._current_response = None
                             self._audio_item = None
+                        if self.on_playback:
+                            self.on_playback(PlaybackEvent(PlaybackAction.COMPLETED, response_id))
                         continue
                     if self.audio.playback._stream is None:
                         await asyncio.to_thread(self.audio.playback.start, chunk)
                     else:
                         await asyncio.to_thread(self.audio.playback.write, chunk, self.settings.audio_timeout)
+                    if self.on_playback:
+                        self.on_playback(PlaybackEvent(PlaybackAction.STARTED, response_id))
                 except AudioError:
                     if generation != self._generation or self.stop_event.is_set():
                         continue
@@ -208,6 +214,8 @@ class VoiceConversation:
             pass  # wait for any in-flight write to finish after stop unblocks it
         self._current_response = None
         self._audio_item = None
+        if response_id and self.on_playback:
+            self.on_playback(PlaybackEvent(PlaybackAction.INTERRUPTED, response_id))
         self._output_rate = StreamingPCM(API_RATE, self.settings.audio_playback_rate)
         if item_id:
             await self.client.send({"type": "conversation.item.truncate", "item_id": item_id,
@@ -224,8 +232,8 @@ class VoiceConversation:
         await self._interrupt_output(cancel_server=True)
 
     async def handle_event(self, event: ConversationEvent) -> None:
-        if self.on_event is not None:
-            self.on_event(event)
+        if event.kind in {"invalid", "duplicate", "unknown"}:
+            return
         kind = event.kind
         if kind == "input_audio_buffer.speech_started":
             self.heard_speech = True
@@ -278,8 +286,12 @@ class VoiceConversation:
                 await self._interrupt_output()
             else:
                 await self._interrupt_output()
+                if self.on_event:
+                    self.on_event(event)
                 raise VoiceError(f"OpenAI response {event.status or 'failed'}")
         elif kind == "error":
+            if self.on_event:
+                self.on_event(event)
             raise VoiceError(f"OpenAI session error ({event.error_code or 'unknown'})")
         if event.role in {"user", "assistant"} and event.text is not None and event.item_id:
             if event.response_id in self._blocked:
@@ -292,6 +304,8 @@ class VoiceConversation:
             self.transcripts[key] = transcript
             if event.final and self.on_transcript:
                 self.on_transcript(transcript)
+        if self.on_event is not None:
+            self.on_event(event)
 
     async def close(self) -> None:
         self.stop_event.set()

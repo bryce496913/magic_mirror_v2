@@ -50,6 +50,8 @@ p, h2 { margin: 0; }
 .assistant { text-align: center; }
 .assistant .module-status { font-size: clamp(1.2rem, 2vw, 1.8rem); }
 .assistant .module-detail { max-width: 60rem; margin-inline: auto; }
+.assistant-transcript { max-width: 60rem; margin: 0.3rem auto 0; color: #d4d4d4; font-size: clamp(0.95rem, 1.6vw, 1.35rem); line-height: 1.25; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow-wrap: anywhere; }
+.assistant-answer { color: #fff; }
 .app-status { color: #666666; font-size: 0.75rem; text-align: center; }
 @media (max-width: 700px) {
   .mirror { gap: 1.25rem; padding: 1.25rem; }

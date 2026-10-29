@@ -9,6 +9,7 @@
   <script defer src="{{ url_for('dashboard.static', filename='clock.js') }}"></script>
   <script defer src="{{ url_for('dashboard.static', filename='modules.js') }}"></script>
   <script defer src="{{ url_for('dashboard.static', filename='data.js') }}"></script>
+  <script defer src="{{ url_for('dashboard.static', filename='assistant.js') }}"></script>
 </head>
 <body>
 <main class="mirror" aria-label="Magic Mirror V2 dashboard">
@@ -70,6 +71,8 @@
       <h2 id="assistant-title">Assistant</h2>
       <p class="module-status" data-role="status">Unavailable</p>
       <p class="module-detail" data-role="detail">Conversation will appear here.</p>
+      <p class="assistant-transcript" data-role="user-transcript" hidden></p>
+      <p class="assistant-transcript assistant-answer" data-role="assistant-transcript" hidden></p>
     </section>
     {% endif %}
     <p class="app-status">Application status: Running</p>

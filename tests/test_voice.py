@@ -10,6 +10,8 @@ import pytest
 from magic_mirror.assistant.client import RealtimeError
 from magic_mirror.assistant.events import ConversationEvent, ConversationState
 from magic_mirror.assistant.resample import PCMRateError, StreamingPCM, StreamingPeakLimiter
+from magic_mirror.assistant.display import AssistantStateStore
+from magic_mirror.assistant.wake import WakeState
 from magic_mirror.assistant.voice import Transcript, VoiceConversation, VoiceError
 from magic_mirror.assistant.voice_cli import main as cli_main
 from magic_mirror.audio import AudioError
@@ -209,6 +211,35 @@ def test_complete_two_turn_conversation_and_streaming():
         assert len(latencies) == 2 and all(x >= 0 for x in latencies)
         assert audio.closed and client.closed and not audio.capture.active
         assert audio.playback._stream is None
+    asyncio.run(scenario())
+
+
+def test_display_callbacks_follow_accepted_events_and_real_playback():
+    async def scenario():
+        voice, audio, client, _, _ = make_voice()
+        store = AssistantStateStore()
+        store.on_state(WakeState.LISTENING)
+        voice.on_event = store.on_event
+        voice.on_playback = store.on_playback
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        client.queue.put_nowait(event("input_audio_buffer.speech_started", item="u"))
+        client.queue.put_nowait(event("conversation.item.input_audio_transcription.completed", item="u", role="user", text="Question?", final=True))
+        client.queue.put_nowait(event("response.created", response="r"))
+        client.queue.put_nowait(event("response.output_audio_transcript.delta", response="r", item="a", role="assistant", text="An"))
+        client.queue.put_nowait(event("response.output_audio.delta", response="r", item="a", audio=pcm_audio()))
+        await wait_until(lambda: store.snapshot().playback)
+        assert store.snapshot().assistant_text == "An"
+        client.queue.put_nowait(event("response.output_audio_transcript.done", response="r", item="a", role="assistant", text="Answer.", final=True))
+        client.queue.put_nowait(event("response.done", response="r", status="completed"))
+        await wait_until(lambda: audio.playback._stream is None and store.snapshot().assistant_final)
+        assert store.snapshot().assistant_text == "Answer."
+        assert not store.snapshot().playback
+        client.queue.put_nowait(event("response.output_audio.delta", response="r", item="a", audio=pcm_audio()))
+        await asyncio.sleep(0.01)
+        assert audio.playback.starts == 1
+        voice.stop_event.set()
+        await task
     asyncio.run(scenario())
 
 
