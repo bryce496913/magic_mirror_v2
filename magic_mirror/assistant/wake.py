@@ -14,7 +14,7 @@ import psutil
 from ..audio import AudioError, AudioManager
 from ..config import Settings, WAKE_MODEL_FILES, WAKE_MODEL_STEM
 from .client import RealtimeError
-from .events import ConversationEvent, PlaybackAction, PlaybackEvent
+from .events import ConversationEvent, PlaybackEvent
 from .voice import VoiceConversation, VoiceError
 
 READ_MS = 100
@@ -209,6 +209,13 @@ class WakeController:
         if self.voice is not None:
             self.voice.stop_event.set()
 
+    async def cancel_reply(self) -> bool:
+        """Cancel the current reply without ending local wake detection."""
+        if self.voice is None:
+            return False
+        await self.voice.cancel_reply()
+        return True
+
     def _voice_event(self, event: ConversationEvent) -> None:
         if self.on_voice_event:
             self.on_voice_event(event)
@@ -224,11 +231,12 @@ class WakeController:
         elif event.kind in {"response.created", "response.output_audio.delta"}:
             self._state(WakeState.RESPONDING)
 
+        # Listening resumes only through on_ready, after drain, acoustic
+        # settling, server clear acknowledgment, and local capture discard.
+
     def _playback_event(self, event: PlaybackEvent) -> None:
         if self.on_playback:
             self.on_playback(event)
-        if event.action in {PlaybackAction.COMPLETED, PlaybackAction.INTERRUPTED} and not self.stop_event.is_set():
-            self._state(WakeState.LISTENING)
 
     async def _activate(self) -> None:
         """Keep draining local wake capture until the voice session is configured."""

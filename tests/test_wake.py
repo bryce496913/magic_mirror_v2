@@ -1,6 +1,8 @@
 """Local wake control with fake detector, microphone, voice and process metrics."""
 
 import asyncio
+import base64
+import threading
 import time
 from types import SimpleNamespace
 
@@ -8,10 +10,12 @@ import numpy as np
 import pytest
 
 from magic_mirror.assistant.client import RealtimeError
-from magic_mirror.assistant.events import ConversationEvent, ConversationState
+from magic_mirror.assistant.events import (ConversationEvent, ConversationState,
+                                           PlaybackAction, PlaybackEvent)
 from magic_mirror.assistant.wake import (DecimateTo16k, WakeController, WakeError,
                                         WakeState)
 from magic_mirror.assistant.wake_cli import main as cli_main
+from magic_mirror.assistant.voice import VoiceConversation, VoicePhase
 from magic_mirror.audio import AudioError
 from magic_mirror.config import ConfigurationError, Settings, WAKE_MODEL_FILES
 
@@ -50,6 +54,9 @@ class FakeCapture:
         if was_active:
             self.stops += 1
         return was_active
+
+    def discard_pending(self):
+        return 0
 
 
 class FakeAudio:
@@ -149,6 +156,23 @@ async def wait_until(predicate):
     raise AssertionError("condition did not become true")
 
 
+def test_playback_interruption_waits_for_voice_ready_before_listening():
+    from magic_mirror.assistant.display import AssistantStateStore
+
+    display = AssistantStateStore()
+    controller = WakeController(settings(), audio=FakeAudio(),
+                                on_state=display.on_state, on_voice_event=display.on_event,
+                                on_playback=display.on_playback)
+    controller._voice_event(ConversationEvent("response.created", ConversationState.RESPONDING,
+                                              "session", response_id="reply"))
+    assert controller.state == WakeState.RESPONDING
+    controller._playback_event(PlaybackEvent(PlaybackAction.STARTED, "reply"))
+    assert display.snapshot().playback
+    controller._playback_event(PlaybackEvent(PlaybackAction.INTERRUPTED, "reply"))
+    assert controller.state == WakeState.RESPONDING
+    assert display.snapshot().state == "responding" and not display.snapshot().playback
+
+
 def test_disabled_mode_opens_no_audio_or_voice():
     async def scenario():
         audio = FakeAudio()
@@ -216,6 +240,142 @@ def test_wake_handoff_states_cooldown_and_return_to_idle():
     asyncio.run(scenario())
 
 
+def test_real_voice_handoff_keeps_wake_local_and_ignores_speaker_echo():
+    from magic_mirror.assistant.display import AssistantStateStore
+
+    class ArmedDetector(FakeDetector):
+        armed = False
+
+        def process(self, frames):
+            self.calls += 1
+            result, self.armed = self.armed, False
+            return result
+
+    class Playback:
+        def __init__(self):
+            self._stream = None
+            self.started = 0
+            self.draining = threading.Event()
+            self.release = threading.Event()
+
+        def start(self, initial_pcm):
+            assert self._stream is None
+            self._stream = object()
+            self.started += 1
+
+        def write(self, frames, timeout=None):
+            assert self._stream is not None
+
+        def drain(self, timeout=None):
+            self.draining.set()
+            assert self.release.wait(timeout=2)
+
+        def stop(self):
+            self._stream = None
+
+        def played_frames(self):
+            return 2400
+
+    class VoiceAudio(FakeAudio):
+        def __init__(self):
+            super().__init__()
+            self.playback = Playback()
+
+        def selected(self, direction):
+            assert direction == "output"
+            return object()
+
+        def close(self):
+            super().close()
+            self.playback.stop()
+
+    class Client:
+        def __init__(self):
+            self.session_id = "session"
+            self.queue = asyncio.Queue()
+            self.queue.put_nowait(ConversationEvent("session.updated", ConversationState.READY, "session"))
+            self.sent = []
+            self.connections = 0
+            self.closed = False
+
+        async def connect(self):
+            self.connections += 1
+
+        async def send(self, payload):
+            self.sent.append(payload)
+            if payload["type"] == "input_audio_buffer.clear":
+                self.queue.put_nowait(ConversationEvent("input_audio_buffer.cleared", ConversationState.READY, "session"))
+
+        async def receive(self):
+            return await self.queue.get()
+
+        async def close(self):
+            self.closed = True
+
+    async def scenario():
+        detector, audio, client, states = ArmedDetector(), VoiceAudio(), Client(), []
+        display = AssistantStateStore()
+        voices = []
+
+        def state_changed(state):
+            states.append(state)
+            display.on_state(state)
+
+        def make_voice(*args, **kwargs):
+            voice = VoiceConversation(*args, client=client, **kwargs)
+            voices.append(voice)
+            return voice
+
+        controller = WakeController(settings(wake_cooldown_seconds=0.3,
+                                             audio_buffer_duration=0.02,
+                                             audio_acoustic_settle_seconds=0.02),
+                                    audio=audio, detector_factory=lambda _: detector,
+                                    voice_factory=make_voice, process=FakeProcess(),
+                                    on_state=state_changed, on_voice_event=display.on_event,
+                                    on_playback=display.on_playback)
+        task = asyncio.create_task(controller.run())
+        try:
+            await wait_until(lambda: detector.calls >= 3 and controller.state == WakeState.IDLE)
+            assert client.connections == 0 and not client.sent  # local idle only
+            detector.armed = True
+            await wait_until(lambda: len(voices) == 1 and voices[0].phase == VoicePhase.LISTENING)
+            assert audio.capture.starts == 2 and client.connections == 1
+            assert audio.capture.active and audio.capture.owner == "voice"
+            client.queue.put_nowait(ConversationEvent("input_audio_buffer.speech_started", ConversationState.LISTENING, "session", item_id="user"))
+            client.queue.put_nowait(ConversationEvent("input_audio_buffer.speech_stopped", ConversationState.PROCESSING, "session", item_id="user"))
+            client.queue.put_nowait(ConversationEvent("response.created", ConversationState.RESPONDING, "session", response_id="reply"))
+            audio_chunk = base64.b64encode(np.full(2400, 1000, dtype="<i2").tobytes()).decode()
+            client.queue.put_nowait(ConversationEvent("response.output_audio.delta", ConversationState.RESPONDING,
+                                                     "session", "reply", "audio", audio_base64=audio_chunk))
+            await wait_until(lambda: audio.playback.started == 1)
+            assert controller.state == WakeState.RESPONDING
+            assert display.snapshot().playback
+            detector_calls = detector.calls
+            sent = sum(x["type"] == "input_audio_buffer.append" for x in client.sent)
+            client.queue.put_nowait(ConversationEvent("input_audio_buffer.speech_started", ConversationState.LISTENING, "session", item_id="echo"))
+            client.queue.put_nowait(ConversationEvent("response.done", ConversationState.READY, "session", "reply", status="completed"))
+            await wait_until(lambda: audio.playback.draining.is_set())
+            assert controller.state == WakeState.RESPONDING and voices[0].phase == VoicePhase.PLAYBACK_DRAINING
+            assert display.snapshot().state == "responding" and display.snapshot().playback
+            await asyncio.sleep(0.03)
+            assert detector.calls == detector_calls
+            assert sum(x["type"] == "input_audio_buffer.append" for x in client.sent) == sent
+            audio.playback.release.set()
+            await wait_until(lambda: controller.state == WakeState.LISTENING and
+                             voices[0].phase == VoicePhase.LISTENING and not display.snapshot().playback)
+            controller.end_conversation()
+            await wait_until(lambda: controller.state == WakeState.IDLE and audio.capture.starts == 3)
+            before = detector.calls
+            await asyncio.sleep(0.03)
+            assert detector.calls == before and client.connections == 1 and client.closed
+        finally:
+            audio.playback.release.set()
+            controller.stop()
+            await task
+        assert not audio.capture.active and detector.closed
+    asyncio.run(scenario())
+
+
 def test_activation_while_busy_does_not_start_second_session():
     async def scenario():
         audio, detector, gate = FakeAudio(), FakeDetector([True, True, True]), asyncio.Event()
@@ -263,6 +423,25 @@ def test_spoken_end_returns_to_idle_without_stopping_detector():
         controller.stop()
         await task
         assert not audio.capture.active
+    asyncio.run(scenario())
+
+
+def test_manual_reply_cancel_keeps_wake_controller_active():
+    class CancellableVoice:
+        def __init__(self):
+            self.cancelled = 0
+            self.stop_event = asyncio.Event()
+
+        async def cancel_reply(self):
+            self.cancelled += 1
+
+    async def scenario():
+        controller = WakeController(settings(), audio=FakeAudio(), process=FakeProcess())
+        assert await controller.cancel_reply() is False
+        voice = CancellableVoice()
+        controller.voice = voice
+        assert await controller.cancel_reply() is True
+        assert voice.cancelled == 1 and not voice.stop_event.is_set()
     asyncio.run(scenario())
 
 

@@ -13,6 +13,8 @@ from ..audio import AudioError
 from ..config import ConfigurationError, Settings
 from ..hardware.led import LedError, RGBLedController
 from .display import AssistantStateServer, AssistantStateStore
+from .client import RealtimeError
+from .voice import VoiceError
 from .wake import WakeController, WakeError, WakeMetrics, WakeState
 
 
@@ -44,6 +46,7 @@ async def _interactive(settings: Settings) -> None:
     loop = asyncio.get_running_loop()
     registered_signals = []
     stdin_registered = False
+    commands: set[asyncio.Task] = set()
 
     def command() -> None:
         line = sys.stdin.readline().strip().lower()
@@ -51,6 +54,21 @@ async def _interactive(settings: Settings) -> None:
             controller.stop()
         elif line == "e":
             controller.end_conversation()
+        elif line == "c":
+            task = asyncio.create_task(controller.cancel_reply())
+            commands.add(task)
+
+            def finished(done: asyncio.Task) -> None:
+                commands.discard(done)
+                try:
+                    done.result()
+                except (AudioError, RealtimeError, VoiceError) as exc:
+                    print(f"Reply cancellation failed: {exc}", file=sys.stderr)
+                    controller.end_conversation()
+                except asyncio.CancelledError:
+                    pass
+
+            task.add_done_callback(finished)
 
     try:
         await server.start()  # also rejects a second wake owner before GPIO or audio opens
@@ -65,6 +83,7 @@ async def _interactive(settings: Settings) -> None:
         print(f"Local wake detector starting for '{settings.wake_phrase}'. "
               "After detection, wait for the listening cue before asking a question. "
               "Say 'go to sleep' or press e+Enter to end a conversation; "
+              "c+Enter cancels a reply; "
               "q+Enter or Ctrl+C stops the assistant.", flush=True)
         await controller.run()
     finally:
@@ -72,6 +91,10 @@ async def _interactive(settings: Settings) -> None:
             loop.remove_reader(sys.stdin.fileno())
         for name in registered_signals:
             loop.remove_signal_handler(name)
+        for task in commands:
+            task.cancel()
+        if commands:
+            await asyncio.gather(*commands, return_exceptions=True)
         store.on_state(WakeState.STOPPED)
         try:
             if led is not None:

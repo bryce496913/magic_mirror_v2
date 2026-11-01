@@ -241,6 +241,17 @@ class AudioCapture:
         frame_count = round(seconds * self.manager.settings.audio_capture_rate)
         return self.read_frames(frame_count, timeout=seconds + self.manager.settings.audio_timeout)
 
+    def discard_pending(self):
+        """Drop queued capture frames and any partial read before listening resumes."""
+        with self._read_lock:
+            self._remainder = None
+            discarded = 0
+            while True:
+                try:
+                    discarded += len(self._frames.get_nowait())
+                except Empty:
+                    return discarded
+
     def stop(self):
         with self._lock:
             stream = self._stream

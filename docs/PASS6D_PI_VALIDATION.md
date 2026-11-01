@@ -8,9 +8,10 @@ On the Pi, after Pass 6A–6C have been merged and the model from the [Pass 6C g
 
 ```bash
 cd magic_mirror_v2
-git fetch origin
-git switch --track origin/pass-6d-assistant-sync
-python3 -m venv .venv
+git fetch origin main pass-6d-assistant-sync
+git switch pass-6d-assistant-sync || git switch --track origin/pass-6d-assistant-sync
+git pull --ff-only origin pass-6d-assistant-sync
+test -x .venv/bin/python || python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt -r requirements-wake.txt
 .venv/bin/python -m pip check
 .venv/bin/python -m pytest -q
@@ -20,7 +21,7 @@ mkdir -p .private
 chmod 700 .private
 ```
 
-If the branch already exists locally, use `git switch pass-6d-assistant-sync` and `git pull --ff-only`. No new Python dependency was added in this pass. Keep the existing private Pi-hole credentials and trusted CA under `.private/` or another protected directory. `chmod 700 .private` is required for the assistant socket; its socket and lock file are mode `0600` and are ignored by Git.
+These commands keep an existing `.venv`, `.env`, wake model, and `.private/` contents in place. Do not use `git clean`, reset the Pi checkout, or reinstall the wake model for this update. No new Python dependency was added in this pass. Keep the existing private Pi-hole credentials and trusted CA under `.private/` or another protected directory. `chmod 700 .private` is required for the assistant socket; its socket and lock file are mode `0600` and are ignored by Git. Check `git status --short` before switching branches if the Pi has local tracked changes; preserve them separately before switching.
 
 In `.env`, set `MIRROR_WAKE_ENABLED=true`, `MIRROR_LED_ENABLED=true`, `MIRROR_WAKE_MODEL_DIR` to the existing absolute model directory, and `OPENAI_API_KEY` to the existing private key. Preserve the tested `MIRROR_AUDIO_INPUT_DEVICE=pipewire`, exact `MIRROR_AUDIO_EXPECTED_INPUT_SOURCE`, `MIRROR_AUDIO_OUTPUT_DEVICE=MAX98357A`, 48 kHz mono int16 and `MIRROR_AUDIO_PLAYBACK_GAIN=1.4`. Keep `MIRROR_HOST=127.0.0.1`; the assistant route rejects non-loopback requests even if the main dashboard is deliberately exposed. Restart Flask after changing `.env` so both processes agree about GPIO ownership. Do not start the standalone LED test while either process owns the pins.
 
@@ -51,8 +52,8 @@ The health response should be `{"status":"healthy"}`. The assistant snapshot sho
 
 ## Hardware checks
 
-1. Confirm the idle LED is white and the assistant says **Ready for wake word**. Say the configured wake phrase, then wait for **Listening** and a green LED before asking a short question. Confirm **Processing** and then **Responding** show blue. Compare the displayed user transcript with what was said and the displayed answer with the spoken reply. Partial transcripts have an ellipsis; final ones do not. The wake phrase itself should not appear as the question.
-2. Ask a follow-up. Confirm the previous exchange clears when new speech starts, no unrelated transcript appears, and one response plays at a time. Interrupt a spoken reply with another question. Confirm stale text and audio from the interrupted answer disappear and the new answer belongs to the new turn.
+1. Confirm the idle LED is white and the assistant says **Ready for wake word**. Say the configured wake phrase, then wait for **Listening** and a green LED before asking a short question. Confirm **Processing** and then **Responding** show blue. Blue must remain through speaker playback and drain; green returns only after the acoustic settling period and microphone buffer cleanup. Compare the displayed user transcript with what was said and the displayed answer with the spoken reply. Partial transcripts have an ellipsis; final ones do not. The wake phrase itself should not appear as the question.
+2. Ask a follow-up. Confirm the previous exchange clears when new speech starts, no unrelated transcript appears, and one response plays at a time. During a spoken reply, ask a new question without pressing `c`: the half-duplex microphone must suppress it and must not upload speaker echo or create a second response. Press `c` then Enter to cancel the reply; confirm audio and stale answer text stop, blue remains during settling, and green returns only when listening is safe. Then ask the follow-up and confirm its answer belongs to the new turn.
 3. Test silence after wake, a failed or interrupted network connection, and temporary microphone or speaker unavailability. Confirm a recoverable error appears, the LED turns off during recovery, then white returns only after local wake capture resumes. The CLI limits recovery attempts and must release streams if recovery stops. Never expose the key or transcript in a bug report.
 4. Refresh Chromium during a response and while idle. Confirm the page rehydrates from the current snapshot, with no second microphone stream, OpenAI session, or GPIO owner. Close and reopen Chromium; the assistant should continue independently. Try `curl http://127.0.0.1:5000/api/assistant` only on the Pi; a request made to the Pi's network address should be forbidden.
 5. In terminal B, say “go to sleep” or press `e` then Enter. Confirm the wake CLI returns to white idle and closes the Realtime session. Press Ctrl+C in terminal B. Confirm the LED is off, `/api/assistant` becomes `unavailable` while Flask remains up, and microphone and speaker streams are closed. Restart the same wake CLI without rebooting. Confirm only one process can own its state socket, microphone, and LED at a time.
