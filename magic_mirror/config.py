@@ -3,7 +3,7 @@
 import logging
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlparse
@@ -110,6 +110,14 @@ class Settings:
     audio_playback_gain: float = 1.0
     audio_max_playback_level: float = 1.0
     audio_timeout: float = 5.0
+    openai_api_key: str = field(default="", repr=False, compare=False)
+    realtime_model: str = "gpt-realtime-2.1-mini"
+    realtime_max_session_seconds: int = 900
+    realtime_idle_seconds: int = 60
+    realtime_max_response_seconds: int = 90
+    realtime_connect_timeout: int = 10
+    realtime_retry_limit: int = 2
+    realtime_backoff_seconds: float = 1.0
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "Settings":
@@ -204,6 +212,16 @@ class Settings:
         audio_format = values.get("MIRROR_AUDIO_FRAME_FORMAT", "int16").strip().lower()
         if audio_format not in {"int16", "float32"}:
             raise ConfigurationError("MIRROR_AUDIO_FRAME_FORMAT must be int16 or float32")
+        model = values.get("MIRROR_REALTIME_MODEL", "gpt-realtime-2.1-mini").strip()
+        if not model or len(model) > 100 or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for ch in model):
+            raise ConfigurationError("MIRROR_REALTIME_MODEL must be a valid model identifier")
+        session_seconds = _audio_int(values, "MIRROR_REALTIME_MAX_SESSION_SECONDS", 900, 1, 3600)
+        idle_seconds = _audio_int(values, "MIRROR_REALTIME_IDLE_SECONDS", 60, 1, 3600)
+        if idle_seconds > session_seconds:
+            raise ConfigurationError("MIRROR_REALTIME_IDLE_SECONDS cannot exceed session duration")
+        response_seconds = _audio_int(values, "MIRROR_REALTIME_MAX_RESPONSE_SECONDS", 90, 1, 3600)
+        if response_seconds > session_seconds:
+            raise ConfigurationError("MIRROR_REALTIME_MAX_RESPONSE_SECONDS cannot exceed session duration")
         return cls(host=host, port=port, log_level=level, clock_format=clock_format,
                    display_scale=display_scale, enabled_modules=modules,
                    weather_latitude=latitude, weather_longitude=longitude, weather_unit=unit,
@@ -228,7 +246,15 @@ class Settings:
                    audio_frame_format=audio_format,
                    audio_playback_gain=_audio_float(values, "MIRROR_AUDIO_PLAYBACK_GAIN", 1.0, 0.0, 4.0),
                    audio_max_playback_level=_audio_float(values, "MIRROR_AUDIO_MAX_PLAYBACK_LEVEL", 1.0, 0.1, 1.0),
-                   audio_timeout=_audio_float(values, "MIRROR_AUDIO_TIMEOUT", 5.0, 0.1, 30.0))
+                   audio_timeout=_audio_float(values, "MIRROR_AUDIO_TIMEOUT", 5.0, 0.1, 30.0),
+                   openai_api_key=values.get("OPENAI_API_KEY", "").strip(),
+                   realtime_model=model,
+                   realtime_max_session_seconds=session_seconds,
+                   realtime_idle_seconds=idle_seconds,
+                   realtime_max_response_seconds=response_seconds,
+                   realtime_connect_timeout=_audio_int(values, "MIRROR_REALTIME_CONNECT_TIMEOUT", 10, 1, 60),
+                   realtime_retry_limit=_audio_int(values, "MIRROR_REALTIME_RETRY_LIMIT", 2, 0, 5),
+                   realtime_backoff_seconds=_audio_float(values, "MIRROR_REALTIME_BACKOFF_SECONDS", 1.0, 0.1, 10.0))
 
 
 def configure_logging(level: str) -> None:
