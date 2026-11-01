@@ -1,7 +1,9 @@
 """Pass 6D state, IPC, local access, and LED integration without Pi hardware."""
 
 import asyncio
+import errno
 import signal
+import socket
 import pytest
 
 from magic_mirror import create_app
@@ -115,6 +117,160 @@ def test_private_socket_snapshot_refresh_single_owner_and_restart(tmp_path):
             read_snapshot(path)
         await other.start()
         await other.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stage,error", [
+    ("write", BrokenPipeError(errno.EPIPE, "Broken pipe")),
+    ("drain", ConnectionResetError("Connection lost")),
+    ("drain", BrokenPipeError(errno.EPIPE, "Broken pipe")),
+    ("drain", OSError(errno.ENOTCONN, "Transport endpoint is not connected")),
+    ("wait_closed", BrokenPipeError(errno.EPIPE, "Broken pipe")),
+    ("wait_closed", ConnectionResetError("Connection lost")),
+    ("close", BrokenPipeError(errno.EPIPE, "Broken pipe")),
+])
+def test_snapshot_client_disconnect_during_write_or_close_is_clean(stage, error):
+    class Transport:
+        aborted = False
+        def abort(self):
+            self.aborted = True
+
+    class Writer:
+        def __init__(self):
+            self.transport = Transport()
+            self.closed = False
+            self.data = None
+        def write(self, data):
+            self.data = data
+            if stage == "write":
+                raise error
+        async def drain(self):
+            if stage == "drain":
+                raise error
+        def close(self):
+            self.closed = True
+            if stage == "close":
+                raise error
+        async def wait_closed(self):
+            if stage == "wait_closed":
+                raise error
+
+    async def scenario():
+        writer = Writer()
+        await AssistantStateServer(AssistantStateStore())._handle(None, writer)
+        assert writer.closed and writer.data.endswith(b"\n")
+        assert writer.transport.aborted == (stage == "close")
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stage", ["drain", "wait_closed"])
+def test_snapshot_handler_bounds_slow_clients_without_blocking_other_work(monkeypatch, stage):
+    monkeypatch.setattr("magic_mirror.assistant.display.CLIENT_IO_TIMEOUT", 0.01)
+
+    class Writer:
+        def __init__(self):
+            self.transport = self
+            self.aborted = False
+            self.closed = False
+        def write(self, data):
+            pass
+        async def drain(self):
+            if stage == "drain":
+                await asyncio.Event().wait()
+        def abort(self):
+            self.aborted = True
+        def close(self):
+            self.closed = True
+        async def wait_closed(self):
+            if stage == "wait_closed":
+                await asyncio.Event().wait()
+
+    async def scenario():
+        writer = Writer()
+        handler = asyncio.create_task(AssistantStateServer(AssistantStateStore())._handle(None, writer))
+        await asyncio.sleep(0)  # audio and wake tasks remain schedulable during client I/O
+        assert not handler.done()
+        await asyncio.wait_for(handler, 0.2)
+        assert writer.closed and writer.aborted
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stage", ["write", "drain", "wait_closed"])
+def test_unexpected_snapshot_handler_errors_still_surface_and_close_writer(stage):
+    class Writer:
+        closed = False
+        def write(self, data):
+            if stage == "write":
+                raise OSError(errno.EACCES, "unexpected socket error")
+        async def drain(self):
+            if stage == "drain":
+                raise OSError(errno.EACCES, "unexpected socket error")
+        def close(self):
+            self.closed = True
+        async def wait_closed(self):
+            if stage == "wait_closed":
+                raise OSError(errno.EACCES, "unexpected socket error")
+
+    async def scenario():
+        writer = Writer()
+        with pytest.raises(OSError) as caught:
+            await AssistantStateServer(AssistantStateStore())._handle(None, writer)
+        assert caught.value.errno == errno.EACCES and writer.closed
+    asyncio.run(scenario())
+
+
+def test_snapshot_programming_error_still_surfaces_after_writer_cleanup():
+    class BadStore:
+        def snapshot(self):
+            raise RuntimeError("snapshot bug")
+
+    class Writer:
+        closed = False
+        def write(self, data):
+            raise AssertionError("snapshot failed before write")
+        def close(self):
+            self.closed = True
+        async def wait_closed(self):
+            pass
+
+    async def scenario():
+        writer = Writer()
+        with pytest.raises(RuntimeError, match="snapshot bug"):
+            await AssistantStateServer(BadStore())._handle(None, writer)
+        assert writer.closed
+    asyncio.run(scenario())
+
+
+def test_snapshot_socket_repeated_disconnect_poll_and_reconnect(tmp_path):
+    async def scenario():
+        path = tmp_path / "private" / "state.sock"
+        store = AssistantStateStore()
+        store.on_state(WakeState.IDLE)
+        server = AssistantStateServer(store, path)
+        loop = asyncio.get_running_loop()
+        errors = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: errors.append(context))
+        await server.start()
+        try:
+            def disconnect_and_poll():
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.connect(str(path))
+                return read_snapshot(path)
+
+            for _ in range(30):
+                assert (await asyncio.to_thread(disconnect_and_poll))["state"] == "idle"
+            store.on_state(WakeState.LISTENING)
+            assert (await asyncio.to_thread(read_snapshot, path))["state"] == "listening"
+            assert path.stat().st_mode & 0o777 == 0o600
+            other = AssistantStateServer(AssistantStateStore(), path)
+            with pytest.raises(RuntimeError, match="Another assistant process"):
+                await other.start()
+        finally:
+            await server.close()
+            await asyncio.sleep(0)
+            loop.set_exception_handler(previous_handler)
+        assert not errors
     asyncio.run(scenario())
 
 

@@ -1,6 +1,7 @@
 """Current assistant exchange only; no audio, credentials, or transcript history."""
 
 import asyncio
+import errno
 import fcntl
 import json
 import os
@@ -15,6 +16,13 @@ from .wake import WakeState
 
 SOCKET_PATH = Path(__file__).resolve().parents[2] / ".private" / "assistant-state.sock"
 MAX_TEXT = 240
+CLIENT_IO_TIMEOUT = 0.5
+CLIENT_DISCONNECT_ERRNOS = {errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED, errno.ENOTCONN}
+
+
+def _client_disconnected(exc: OSError) -> bool:
+    return (isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)) or
+            exc.errno in CLIENT_DISCONNECT_ERRNOS)
 
 
 @dataclass(frozen=True)
@@ -167,11 +175,29 @@ class AssistantStateServer:
 
     async def _handle(self, _reader, writer) -> None:
         try:
-            writer.write((json.dumps(asdict(self.store.snapshot())) + "\n").encode())
-            await writer.drain()
+            try:
+                writer.write((json.dumps(asdict(self.store.snapshot())) + "\n").encode())
+                await asyncio.wait_for(writer.drain(), CLIENT_IO_TIMEOUT)
+            except TimeoutError:
+                writer.transport.abort()  # a stalled local reader must not hold a handler open
+            except OSError as exc:
+                if not _client_disconnected(exc):
+                    raise
         finally:
-            writer.close()
-            await writer.wait_closed()
+            try:
+                writer.close()
+            except OSError as exc:
+                if not _client_disconnected(exc):
+                    raise
+                writer.transport.abort()
+            else:
+                try:
+                    await asyncio.wait_for(writer.wait_closed(), CLIENT_IO_TIMEOUT)
+                except TimeoutError:
+                    writer.transport.abort()
+                except OSError as exc:
+                    if not _client_disconnected(exc):
+                        raise
 
     async def close(self) -> None:
         if self.server is not None:
