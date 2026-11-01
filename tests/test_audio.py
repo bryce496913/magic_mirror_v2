@@ -159,6 +159,20 @@ def test_capture_frames_record_cancel_and_repeated_start_stop():
     assert backend.inputs[-1].closed
 
 
+def test_capture_discard_pending_removes_remainder_and_queued_speaker_echo():
+    backend = FakeBackend()
+    audio = manager(backend)
+    audio.capture.start()
+    stream = backend.inputs[-1]
+    stream.input(np.arange(10, dtype=np.int16))
+    assert audio.capture.read_frames(3).ravel().tolist() == [0, 1, 2]
+    stream.input(np.arange(10, 14, dtype=np.int16))
+    assert audio.capture.discard_pending() == 4
+    stream.input(np.arange(20, 23, dtype=np.int16))
+    assert audio.capture.read_frames(3).ravel().tolist() == [20, 21, 22]
+    audio.close()
+
+
 def test_capture_cancellation_disconnect_and_buffer_overflow():
     backend = FakeBackend()
     audio = manager(backend)
@@ -312,6 +326,19 @@ def test_competing_capture_and_playback_owners_and_failed_open_recovery():
     second.capture.start()
     second.playback.start()
     second.close()
+
+
+def test_playback_start_primes_first_callback_and_tracks_played_frames():
+    backend = FakeBackend()
+    audio = manager(backend)
+    initial = np.array([[100], [200], [300]], dtype=np.int16)
+    audio.playback.start(initial)
+    assert np.array_equal(backend.outputs[-1].output(3), initial)
+    assert audio.playback.played_frames() == 3
+    audio.playback.stop()
+    audio.playback.start()
+    assert audio.playback.played_frames() == 0
+    audio.close()
 
 
 def test_playback_queue_drain_cancel_and_silence():
@@ -556,6 +583,9 @@ def test_flask_keyboard_interrupt_closes_audio_without_opening_it(monkeypatch):
     {"MIRROR_AUDIO_PLAYBACK_GAIN": "5"},
     {"MIRROR_AUDIO_MAX_PLAYBACK_LEVEL": "0"},
     {"MIRROR_AUDIO_TIMEOUT": "0"},
+    {"MIRROR_AUDIO_ACOUSTIC_SETTLE_SECONDS": "-0.1"},
+    {"MIRROR_AUDIO_ACOUSTIC_SETTLE_SECONDS": "2.1"},
+    {"MIRROR_AUDIO_ACOUSTIC_SETTLE_SECONDS": "nan"},
     {"MIRROR_AUDIO_EXPECTED_INPUT_SOURCE": "bad\nsource"},
 ])
 def test_invalid_audio_config(values):
@@ -573,3 +603,5 @@ def test_audio_config_defaults_and_overrides():
     assert settings.audio_playback_rate == 44100 and settings.audio_frame_format == "float32"
     assert settings.audio_playback_gain == 2 and settings.audio_max_playback_level == 0.9
     assert Settings.from_env({"MIRROR_AUDIO_EXPECTED_INPUT_SOURCE": "alsa_input.usb-example"}).audio_expected_input_source == "alsa_input.usb-example"
+    assert Settings.from_env({}).audio_acoustic_settle_seconds == 0.35
+    assert Settings.from_env({"MIRROR_AUDIO_ACOUSTIC_SETTLE_SECONDS": "0.5"}).audio_acoustic_settle_seconds == 0.5

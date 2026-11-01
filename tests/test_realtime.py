@@ -60,6 +60,16 @@ def test_missing_key_never_connects():
     run(scenario())
 
 
+def test_input_buffer_clear_ack_is_typed_and_preserves_turn_state():
+    tracker = EventTracker()
+    tracker.parse(CREATED, 0)
+    tracker.parse(UPDATED, 0)
+    cleared = tracker.parse({"type": "input_audio_buffer.cleared", "event_id": "clear-1"}, 1)
+    assert cleared.kind == "input_audio_buffer.cleared"
+    assert cleared.session_id == "sess_test" and cleared.event_id == "clear-1"
+    assert cleared.state == ConversationState.READY
+
+
 def test_connect_ack_settings_and_close():
     async def scenario():
         socket = FakeSocket(CREATED, UPDATED)

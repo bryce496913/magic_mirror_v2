@@ -82,6 +82,8 @@ class EventTracker:
             self.state = ConversationState.LISTENING
         elif kind == "input_audio_buffer.speech_stopped":
             self.state = ConversationState.PROCESSING
+        elif kind == "input_audio_buffer.cleared":
+            pass
         elif kind == "response.created":
             if not response_id:
                 return ConversationEvent("invalid", self.state, self.session_id, event_id=event_id)

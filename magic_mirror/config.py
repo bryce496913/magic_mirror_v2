@@ -110,6 +110,7 @@ class Settings:
     audio_playback_gain: float = 1.0
     audio_max_playback_level: float = 1.0
     audio_timeout: float = 5.0
+    audio_acoustic_settle_seconds: float = 0.35
     openai_api_key: str = field(default="", repr=False, compare=False)
     realtime_model: str = "gpt-realtime-2.1-mini"
     realtime_max_session_seconds: int = 900
@@ -247,6 +248,8 @@ class Settings:
                    audio_playback_gain=_audio_float(values, "MIRROR_AUDIO_PLAYBACK_GAIN", 1.0, 0.0, 4.0),
                    audio_max_playback_level=_audio_float(values, "MIRROR_AUDIO_MAX_PLAYBACK_LEVEL", 1.0, 0.1, 1.0),
                    audio_timeout=_audio_float(values, "MIRROR_AUDIO_TIMEOUT", 5.0, 0.1, 30.0),
+                   audio_acoustic_settle_seconds=_audio_float(
+                       values, "MIRROR_AUDIO_ACOUSTIC_SETTLE_SECONDS", 0.35, 0.0, 2.0),
                    openai_api_key=values.get("OPENAI_API_KEY", "").strip(),
                    realtime_model=model,
                    realtime_max_session_seconds=session_seconds,
