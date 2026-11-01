@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import time
+import threading
 
 import numpy as np
 import pytest
@@ -10,7 +11,7 @@ import pytest
 from magic_mirror.assistant.client import RealtimeError
 from magic_mirror.assistant.events import ConversationEvent, ConversationState
 from magic_mirror.assistant.resample import PCMRateError, StreamingPCM, StreamingPeakLimiter
-from magic_mirror.assistant.voice import Transcript, VoiceConversation, VoiceError
+from magic_mirror.assistant.voice import Transcript, VoiceConversation, VoiceError, VoicePhase
 from magic_mirror.assistant.voice_cli import main as cli_main
 from magic_mirror.audio import AudioError
 from magic_mirror.config import Settings
@@ -27,6 +28,8 @@ class FakeCapture:
         self.active = False
         self.starts = 0
         self.reads = 0
+        self.discards = 0
+        self.value = 1000
 
     def start(self):
         if self.active:
@@ -40,10 +43,14 @@ class FakeCapture:
         if not self.active:
             raise AudioError("capture stopped")
         self.reads += 1
-        return np.full((count, 1), 1000, dtype=np.int16)
+        return np.full((count, 1), self.value, dtype=np.int16)
 
     def stop(self):
         self.active = False
+
+    def discard_pending(self):
+        self.discards += 1
+        return 0
 
 
 class FakePlayback:
@@ -106,6 +113,7 @@ class FakeClient:
         self.closed = False
         self.connect_error = None
         self.cancelled = []
+        self.auto_clear_ack = True
 
     async def connect(self):
         if self.connect_error:
@@ -114,6 +122,8 @@ class FakeClient:
 
     async def send(self, payload):
         self.sent.append(payload)
+        if payload["type"] == "input_audio_buffer.clear" and self.auto_clear_ack:
+            self.queue.put_nowait(event("input_audio_buffer.cleared"))
 
     async def receive(self):
         value = await self.queue.get()
@@ -130,9 +140,11 @@ class FakeClient:
 
 def make_voice(**options):
     audio, client = FakeAudio(), FakeClient()
-    settings = Settings(audio_capture_rate=48000, audio_playback_rate=48000,
-                        audio_capture_channels=1, audio_playback_channels=1,
-                        audio_frame_format="int16", **options)
+    values = dict(audio_capture_rate=48000, audio_playback_rate=48000,
+                  audio_capture_channels=1, audio_playback_channels=1,
+                  audio_frame_format="int16", audio_acoustic_settle_seconds=0.01)
+    values.update(options)
+    settings = Settings(**values)
     transcripts = []
     latencies = []
     voice = VoiceConversation(settings, audio=audio, client=client,
@@ -189,7 +201,7 @@ def test_complete_two_turn_conversation_and_streaming():
         await wait_until(lambda: audio.capture.active and audio.capture.reads >= 2)
         assert client.sent[0]["type"] == "session.update"
         vad = client.sent[0]["session"]["audio"]["input"]["turn_detection"]
-        assert vad["type"] == "server_vad" and vad["create_response"] and vad["interrupt_response"]
+        assert vad["type"] == "server_vad" and vad["create_response"] and not vad["interrupt_response"]
         for number in (1, 2):
             client.queue.put_nowait(event("input_audio_buffer.speech_started", item=f"u{number}"))
             client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item=f"u{number}"))
@@ -198,7 +210,9 @@ def test_complete_two_turn_conversation_and_streaming():
             client.queue.put_nowait(event("response.output_audio.delta", response=f"r{number}", item=f"a{number}", audio=pcm_audio()))
             client.queue.put_nowait(event("response.output_audio_transcript.done", response=f"r{number}", item=f"a{number}", role="assistant", text=f"answer {number}", final=True))
             client.queue.put_nowait(event("response.done", response=f"r{number}", status="completed"))
-            await wait_until(lambda: audio.playback.starts == number and audio.playback._stream is None)
+            await wait_until(lambda: audio.playback.starts == number and
+                             audio.playback._stream is None and voice.phase == VoicePhase.LISTENING)
+            await wait_until(lambda: sum(x["type"] == "input_audio_buffer.append" for x in client.sent) >= number + 1)
         voice.stop_event.set()
         await task
         assert sum(x["type"] == "input_audio_buffer.append" for x in client.sent) >= 2
@@ -207,12 +221,172 @@ def test_complete_two_turn_conversation_and_streaming():
         assert [(x.role, x.text) for x in transcripts] == [("user", "question 1"), ("assistant", "answer 1"),
                                                             ("user", "question 2"), ("assistant", "answer 2")]
         assert len(latencies) == 2 and all(x >= 0 for x in latencies)
+        assert not any(x["type"] == "response.create" for x in client.sent)
         assert audio.closed and client.closed and not audio.capture.active
         assert audio.playback._stream is None
     asyncio.run(scenario())
 
 
-def test_interruption_drops_stale_audio_and_truncates():
+def test_half_duplex_suppresses_processing_playback_and_drain_then_accepts_followup():
+    class GatedPlayback(FakePlayback):
+        def __init__(self):
+            super().__init__()
+            self.draining = threading.Event()
+            self.release = threading.Event()
+        def drain(self, timeout=None):
+            self.draining.set()
+            assert self.release.wait(timeout=2)
+            super().drain(timeout)
+
+    async def scenario():
+        voice, audio, client, _, _ = make_voice()
+        playback = GatedPlayback()
+        audio.playback = playback
+        task = asyncio.create_task(voice.run())
+        try:
+            await wait_until(lambda: audio.capture.active and audio.capture.reads >= 2)
+            client.queue.put_nowait(event("input_audio_buffer.speech_started", item="u1"))
+            client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="u1"))
+            await wait_until(lambda: voice.phase == VoicePhase.PROCESSING)
+            count = sum(x["type"] == "input_audio_buffer.append" for x in client.sent)
+            await asyncio.sleep(0.03)
+            assert sum(x["type"] == "input_audio_buffer.append" for x in client.sent) == count
+            client.queue.put_nowait(event("response.created", response="r1"))
+            client.queue.put_nowait(event("response.output_audio.delta", response="r1", item="a1", audio=pcm_audio()))
+            await wait_until(lambda: playback.starts == 1)
+            assert voice.phase == VoicePhase.RESPONDING
+            client.queue.put_nowait(event("input_audio_buffer.speech_started", item="echo"))
+            client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="echo"))
+            client.queue.put_nowait(event("response.done", response="r1", status="completed"))
+            await wait_until(lambda: playback.draining.is_set())
+            assert voice.phase == VoicePhase.PLAYBACK_DRAINING
+            await asyncio.sleep(0.03)
+            assert sum(x["type"] == "input_audio_buffer.append" for x in client.sent) == count
+            assert voice.suppressed_input_frames > 0
+            playback.release.set()
+            await wait_until(lambda: voice.phase == VoicePhase.LISTENING and audio.capture.discards == 1)
+            await wait_until(lambda: sum(x["type"] == "input_audio_buffer.append" for x in client.sent) > count)
+            assert not any(x["type"] == "response.create" for x in client.sent)
+            client.queue.put_nowait(event("input_audio_buffer.speech_started", item="u2"))
+            client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="u2"))
+            client.queue.put_nowait(event("response.created", response="r2"))
+            client.queue.put_nowait(event("response.output_audio.delta", response="r2", item="a2", audio=pcm_audio()))
+            client.queue.put_nowait(event("response.done", response="r2", status="completed"))
+            await wait_until(lambda: playback.starts == 2 and voice.phase == VoicePhase.LISTENING)
+            assert audio.capture.starts == 1 and playback.starts == 2
+        finally:
+            playback.release.set()
+            voice.stop_event.set()
+            await task
+        assert audio.closed and client.closed
+    asyncio.run(scenario())
+
+
+def test_server_clear_ack_and_local_discard_precede_resume():
+    async def scenario():
+        voice, audio, client, _, _ = make_voice(audio_acoustic_settle_seconds=0.02)
+        client.auto_clear_ack = False
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="u"))
+        client.queue.put_nowait(event("response.created", response="r"))
+        client.queue.put_nowait(event("response.output_audio.delta", response="r", item="a", audio=pcm_audio()))
+        client.queue.put_nowait(event("response.done", response="r", status="completed"))
+        await wait_until(lambda: any(x["type"] == "input_audio_buffer.clear" for x in client.sent))
+        assert voice.phase == VoicePhase.READY_TO_LISTEN and audio.capture.discards == 0
+        sent = sum(x["type"] == "input_audio_buffer.append" for x in client.sent)
+        audio.capture.value = 25000  # synthetic speaker echo during muted period
+        await asyncio.sleep(0.03)
+        assert sum(x["type"] == "input_audio_buffer.append" for x in client.sent) == sent
+        audio.capture.value = 1000
+        client.queue.put_nowait(event("input_audio_buffer.cleared"))
+        await wait_until(lambda: voice.phase == VoicePhase.LISTENING)
+        assert audio.capture.discards == 1
+        await wait_until(lambda: sum(x["type"] == "input_audio_buffer.append" for x in client.sent) > sent)
+        first_after = [x for x in client.sent if x["type"] == "input_audio_buffer.append"][sent]
+        samples = np.frombuffer(base64.b64decode(first_after["audio"]), dtype="<i2")
+        assert np.max(samples) < 5000  # no muted speaker frames replayed
+        voice.stop_event.set()
+        await task
+    asyncio.run(scenario())
+
+
+def test_first_audio_before_response_created_mutes_input_and_late_created_is_safe():
+    async def scenario():
+        voice, audio, client, _, _ = make_voice()
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        client.queue.put_nowait(event("response.output_audio.delta", response="r", item="a", audio=pcm_audio()))
+        await wait_until(lambda: audio.playback.starts == 1)
+        assert voice.phase == VoicePhase.RESPONDING
+        sent = sum(x["type"] == "input_audio_buffer.append" for x in client.sent)
+        client.queue.put_nowait(event("response.created", response="r"))
+        client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="u"))
+        await asyncio.sleep(0.03)
+        assert sum(x["type"] == "input_audio_buffer.append" for x in client.sent) == sent
+        client.queue.put_nowait(event("response.done", response="r", status="completed"))
+        await wait_until(lambda: voice.phase == VoicePhase.LISTENING)
+        voice.stop_event.set()
+        await task
+    asyncio.run(scenario())
+
+
+def test_unexpected_second_response_without_new_user_turn_closes_cleanly():
+    async def scenario():
+        voice, audio, client, _, _ = make_voice()
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        client.queue.put_nowait(event("response.created", response="r1"))
+        client.queue.put_nowait(event("response.done", response="r1", status="completed"))
+        await wait_until(lambda: voice.phase == VoicePhase.LISTENING and voice._completed_turn)
+        client.queue.put_nowait(event("response.created", response="r2"))
+        with pytest.raises(VoiceError, match="without a new user turn"):
+            await task
+        assert audio.closed and client.closed and audio.playback.starts == 0
+    asyncio.run(scenario())
+
+
+def test_missing_server_clear_ack_closes_session_instead_of_reopening_mic():
+    async def scenario():
+        voice, audio, client, _, _ = make_voice(realtime_connect_timeout=0.05)
+        client.auto_clear_ack = False
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        client.queue.put_nowait(event("response.created", response="r"))
+        client.queue.put_nowait(event("response.done", response="r", status="completed"))
+        with pytest.raises(VoiceError, match="Timed out clearing"):
+            await task
+        assert voice.phase == VoicePhase.READY_TO_LISTEN
+        assert audio.closed and client.closed and not audio.capture.active
+    asyncio.run(scenario())
+
+
+def test_overlapping_response_and_network_outage_release_both_streams():
+    async def scenario():
+        voice, audio, client, _, _ = make_voice()
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        client.queue.put_nowait(event("response.created", response="r1"))
+        client.queue.put_nowait(event("response.output_audio.delta", response="r1", item="a1", audio=pcm_audio()))
+        await wait_until(lambda: audio.playback.starts == 1)
+        client.queue.put_nowait(event("response.created", response="r2"))
+        with pytest.raises(VoiceError, match="Overlapping"):
+            await task
+        assert audio.closed and client.closed and audio.playback.starts == 1
+
+        voice, audio, client, _, _ = make_voice()
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        client.queue.put_nowait(event("response.created", response="r"))
+        await wait_until(lambda: voice.phase == VoicePhase.RESPONDING)
+        client.queue.put_nowait(RealtimeError("Realtime connection closed unexpectedly"))
+        with pytest.raises(RealtimeError):
+            await task
+        assert audio.closed and client.closed and not audio.capture.active
+    asyncio.run(scenario())
+
+
+def test_manual_cancel_drops_stale_audio_and_truncates():
     async def scenario():
         voice, audio, client, _, _ = make_voice()
         task = asyncio.create_task(voice.run())
@@ -220,15 +394,22 @@ def test_interruption_drops_stale_audio_and_truncates():
         client.queue.put_nowait(event("response.created", response="old"))
         client.queue.put_nowait(event("response.output_audio.delta", response="old", item="old-item", audio=pcm_audio(value=1000)))
         await wait_until(lambda: len(audio.playback.writes) == 1)
+        before = sum(x["type"] == "input_audio_buffer.append" for x in client.sent)
         client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user2"))
-        await wait_until(lambda: any(x["type"] == "conversation.item.truncate" for x in client.sent))
+        await asyncio.sleep(0.02)
+        assert audio.playback._stream is not None  # speaker echo cannot barge in
+        assert sum(x["type"] == "input_audio_buffer.append" for x in client.sent) == before
+        await voice.cancel_reply()
+        assert client.cancelled == ["old"] and voice.phase == VoicePhase.LISTENING
+        assert any(x["type"] == "conversation.item.truncate" for x in client.sent)
         client.queue.put_nowait(event("response.output_audio.delta", response="old", item="old-item", audio=pcm_audio(value=2000)))
         client.queue.put_nowait(event("response.done", response="old", status="cancelled"))
+        client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user2"))
         client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="user2"))
         client.queue.put_nowait(event("response.created", response="new"))
         client.queue.put_nowait(event("response.output_audio.delta", response="new", item="new-item", audio=pcm_audio(value=3000)))
         client.queue.put_nowait(event("response.done", response="new", status="completed"))
-        await wait_until(lambda: audio.playback.starts == 2 and audio.playback._stream is None)
+        await wait_until(lambda: audio.playback.starts == 2 and voice.phase == VoicePhase.LISTENING)
         voice.stop_event.set()
         await task
         assert len(audio.playback.writes) == 2
@@ -339,7 +520,12 @@ def test_cancel_during_full_output_queue_never_relabels_stale_chunks():
         incoming = asyncio.create_task(voice.handle_event(event(
             "response.output_audio.delta", response="r", item="i", audio=pcm_audio(count=24000))))
         await wait_until(lambda: voice._output.qsize() == 8)
+        async def acknowledge_clear():
+            await wait_until(lambda: any(x["type"] == "input_audio_buffer.clear" for x in client.sent))
+            await voice.handle_event(event("input_audio_buffer.cleared"))
+        acknowledgment = asyncio.create_task(acknowledge_clear())
         await voice.cancel_reply()
+        await acknowledgment
         await asyncio.wait_for(incoming, 1)
         assert all(entry[0] != voice._generation for entry in list(voice._output._queue))
         assert audio.playback.starts == 0

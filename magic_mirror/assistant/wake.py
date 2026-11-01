@@ -205,6 +205,13 @@ class WakeController:
         if self.voice is not None:
             self.voice.stop_event.set()
 
+    async def cancel_reply(self) -> bool:
+        """Cancel the current reply without ending local wake detection."""
+        if self.voice is None:
+            return False
+        await self.voice.cancel_reply()
+        return True
+
     def _voice_event(self, event: ConversationEvent) -> None:
         if event.role == "user" and event.final and event.text and (
                 " ".join(event.text.strip().lower().rstrip(".!?").split()) in
@@ -217,8 +224,8 @@ class WakeController:
             self._state(WakeState.PROCESSING)
         elif event.kind in {"response.created", "response.output_audio.delta"}:
             self._state(WakeState.RESPONDING)
-        elif event.kind == "response.done" and event.status == "completed":
-            self._state(WakeState.LISTENING)
+        # Listening resumes only through on_ready, after speaker drain, acoustic
+        # settling, server clear acknowledgment, and local capture discard.
 
     async def _activate(self) -> None:
         """Keep draining local wake capture until the voice session is configured."""
