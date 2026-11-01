@@ -4,7 +4,7 @@ import asyncio
 import base64
 import binascii
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -50,12 +50,20 @@ class VoiceConversation:
                  client: RealtimeClient | None = None,
                  on_transcript: Callable[[Transcript], None] | None = None,
                  on_latency: Callable[[float], None] | None = None,
+                 on_event: Callable[[ConversationEvent], None] | None = None,
+                 before_capture: Callable[[], Awaitable[None]] | None = None,
+                 on_ready: Callable[[], None] | None = None,
+                 first_speech_seconds: float | None = None,
                  clock: Callable[[], float] = time.monotonic):
         self.settings = settings
         self.audio = audio or AudioManager(settings, enabled=True)
         self.client = client or RealtimeClient(settings)
         self.on_transcript = on_transcript
         self.on_latency = on_latency
+        self.on_event = on_event
+        self.before_capture = before_capture
+        self.on_ready = on_ready
+        self.first_speech_seconds = first_speech_seconds
         self.clock = clock
         self.transcripts: dict[tuple[str, str, int], Transcript] = {}
         self.stop_event = asyncio.Event()
@@ -77,6 +85,7 @@ class VoiceConversation:
         self._last_speech = self.clock()
         self._speech_end: float | None = None
         self._first_audio_reported = False
+        self.heard_speech = False
         self._completed_turn = False
         self._turn_pending = False
         self._input_rate: StreamingPCM | None = None
@@ -126,8 +135,13 @@ class VoiceConversation:
                         raise VoiceError("OpenAI voice session ID changed")
                     break
             await asyncio.to_thread(self.audio.selected, "output")
-            await asyncio.to_thread(self.audio.capture.start)
+            if self.before_capture is not None:
+                await self.before_capture()
+            if not await asyncio.to_thread(self.audio.capture.start):
+                raise VoiceError("Microphone was still active before voice capture")
             self.phase = VoicePhase.LISTENING
+            if self.on_ready is not None:
+                self.on_ready()
             self._last_speech = self.clock()
             self._tasks = [asyncio.create_task(self._capture_loop()),
                            asyncio.create_task(self._receive_loop()),
@@ -173,7 +187,9 @@ class VoiceConversation:
 
     async def _silence_loop(self) -> None:
         while not self.stop_event.is_set():
-            if self.phase == VoicePhase.LISTENING and self.clock() - self._last_speech >= SILENCE_SECONDS:
+            silence_limit = (self.first_speech_seconds if not self.heard_speech and
+                             self.first_speech_seconds is not None else SILENCE_SECONDS)
+            if self.phase == VoicePhase.LISTENING and self.clock() - self._last_speech >= silence_limit:
                 self.stop_event.set()
                 return
             await asyncio.sleep(1)
@@ -208,6 +224,8 @@ class VoiceConversation:
                 self._last_speech = self.clock()
                 self._turn_pending = False
                 self.phase = VoicePhase.LISTENING
+                if self.on_ready is not None:
+                    self.on_ready()
 
     async def _playback_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -275,15 +293,20 @@ class VoiceConversation:
         self._completed_turn = True
 
     async def handle_event(self, event: ConversationEvent) -> None:
+        if event.kind in {"invalid", "duplicate", "unknown"}:
+            return
         kind = event.kind
         if kind == "input_audio_buffer.cleared":
             self._clear_ack.set()
             return
         if kind == "input_audio_buffer.speech_started":
             if self.phase == VoicePhase.LISTENING:
+                self.heard_speech = True
                 self._last_speech = self.clock()
                 self._speech_end = None
                 self._turn_pending = True
+            else:
+                return  # delayed speaker/VAD event cannot re-arm wake or barge in
         elif kind == "input_audio_buffer.speech_stopped":
             if self.phase in {VoicePhase.LISTENING, VoicePhase.PROCESSING}:
                 self._last_speech = self.clock()
@@ -291,6 +314,9 @@ class VoiceConversation:
                 await self._mute_input(VoicePhase.PROCESSING)
             elif self.phase == VoicePhase.RESPONDING and self._speech_end is None:
                 self._speech_end = self.clock()  # response.created arrived before VAD stop
+                return  # not a new processing transition
+            else:
+                return
         elif kind == "response.created" and event.response_id:
             if event.response_id in self._blocked or event.response_id in self._finished_responses:
                 return
@@ -347,8 +373,12 @@ class VoiceConversation:
                 self._completed_turn = True
             else:
                 await self._interrupt_output()
+                if self.on_event is not None:
+                    self.on_event(event)
                 raise VoiceError(f"OpenAI response {event.status or 'failed'}")
         elif kind == "error":
+            if self.on_event is not None:
+                self.on_event(event)
             raise VoiceError(f"OpenAI session error ({event.error_code or 'unknown'})")
         if event.role in {"user", "assistant"} and event.text is not None and event.item_id:
             if event.response_id in self._blocked:
@@ -361,6 +391,8 @@ class VoiceConversation:
             self.transcripts[key] = transcript
             if event.final and self.on_transcript:
                 self.on_transcript(transcript)
+        if self.on_event is not None:
+            self.on_event(event)
 
     async def close(self) -> None:
         self.stop_event.set()
