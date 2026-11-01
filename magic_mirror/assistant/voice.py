@@ -1,4 +1,4 @@
-"""Explicit full-duplex voice conversation using AudioManager and RealtimeClient."""
+"""Explicit half-duplex voice conversation using AudioManager and RealtimeClient."""
 
 import asyncio
 import base64
@@ -6,6 +6,7 @@ import binascii
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 
 import numpy as np
 
@@ -18,6 +19,14 @@ from .resample import StreamingPCM, StreamingPeakLimiter
 API_RATE = 24000
 CHUNK_MS = 100
 SILENCE_SECONDS = 60
+
+
+class VoicePhase(StrEnum):
+    LISTENING = "listening"
+    PROCESSING = "processing"
+    RESPONDING = "responding"
+    PLAYBACK_DRAINING = "playback_draining"
+    READY_TO_LISTEN = "ready_to_listen"
 
 
 class VoiceError(RuntimeError):
@@ -52,7 +61,13 @@ class VoiceConversation:
         self.stop_event = asyncio.Event()
         self._output = asyncio.Queue(maxsize=8)
         self._playback_lock = asyncio.Lock()
+        self._capture_read_lock = asyncio.Lock()
+        self._input_lock = asyncio.Lock()
+        self._clear_ack = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
+        self.phase = VoicePhase.READY_TO_LISTEN
+        self._input_generation = 0
+        self.suppressed_input_frames = 0
         self._generation = 0
         self._blocked: set[str] = set()
         self._finished_responses: set[str] = set()
@@ -62,6 +77,8 @@ class VoiceConversation:
         self._last_speech = self.clock()
         self._speech_end: float | None = None
         self._first_audio_reported = False
+        self._completed_turn = False
+        self._turn_pending = False
         self._input_rate: StreamingPCM | None = None
         self._output_rate: StreamingPCM | None = None
         self._limiter = StreamingPeakLimiter(settings.audio_playback_gain, settings.audio_max_playback_level)
@@ -87,7 +104,7 @@ class VoiceConversation:
                         "transcription": {"model": "gpt-4o-mini-transcribe"},
                         "turn_detection": {"type": "server_vad", "threshold": 0.5,
                                            "prefix_padding_ms": 300, "silence_duration_ms": 600,
-                                           "create_response": True, "interrupt_response": True},
+                                           "create_response": True, "interrupt_response": False},
                     },
                     "output": {"format": {"type": "audio/pcm", "rate": API_RATE},
                                "voice": "marin"},
@@ -110,6 +127,7 @@ class VoiceConversation:
                     break
             await asyncio.to_thread(self.audio.selected, "output")
             await asyncio.to_thread(self.audio.capture.start)
+            self.phase = VoicePhase.LISTENING
             self._last_speech = self.clock()
             self._tasks = [asyncio.create_task(self._capture_loop()),
                            asyncio.create_task(self._receive_loop()),
@@ -131,12 +149,22 @@ class VoiceConversation:
     async def _capture_loop(self) -> None:
         frame_count = self.settings.audio_capture_rate * CHUNK_MS // 1000
         while not self.stop_event.is_set():
-            frames = await asyncio.to_thread(self.audio.capture.read_frames, frame_count)
+            generation = self._input_generation
+            was_listening = self.phase == VoicePhase.LISTENING
+            async with self._capture_read_lock:
+                frames = await asyncio.to_thread(self.audio.capture.read_frames, frame_count)
             if self.stop_event.is_set():
                 break
-            converted = self._input_rate.convert(frames)
-            await self.client.send({"type": "input_audio_buffer.append",
-                                    "audio": base64.b64encode(converted.astype("<i2", copy=False).tobytes()).decode("ascii")})
+            if not was_listening:
+                self.suppressed_input_frames += len(frames)
+                continue
+            async with self._input_lock:
+                if self.phase != VoicePhase.LISTENING or generation != self._input_generation:
+                    self.suppressed_input_frames += len(frames)
+                    continue
+                converted = self._input_rate.convert(frames)
+                await self.client.send({"type": "input_audio_buffer.append",
+                                        "audio": base64.b64encode(converted.astype("<i2", copy=False).tobytes()).decode("ascii")})
 
     async def _receive_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -145,10 +173,41 @@ class VoiceConversation:
 
     async def _silence_loop(self) -> None:
         while not self.stop_event.is_set():
-            if self.clock() - self._last_speech >= SILENCE_SECONDS:
+            if self.phase == VoicePhase.LISTENING and self.clock() - self._last_speech >= SILENCE_SECONDS:
                 self.stop_event.set()
                 return
             await asyncio.sleep(1)
+
+    async def _mute_input(self, phase: VoicePhase) -> None:
+        async with self._input_lock:
+            if self.phase == VoicePhase.LISTENING:
+                self._input_generation += 1
+            self.phase = phase
+
+    async def _ready_to_listen(self, generation: int) -> None:
+        """Clear server and local buffers before another user turn can be uploaded."""
+        if generation != self._generation or self.stop_event.is_set():
+            return
+        await self._mute_input(VoicePhase.READY_TO_LISTEN)
+        await asyncio.sleep(self.settings.audio_acoustic_settle_seconds)
+        if generation != self._generation or self.stop_event.is_set():
+            return
+        self._clear_ack.clear()
+        await self.client.send({"type": "input_audio_buffer.clear"})
+        try:
+            await asyncio.wait_for(self._clear_ack.wait(), self.settings.realtime_connect_timeout)
+        except TimeoutError:
+            raise VoiceError("Timed out clearing the Realtime input buffer") from None
+        async with self._capture_read_lock:
+            await asyncio.to_thread(self.audio.capture.discard_pending)
+            async with self._input_lock:
+                if generation != self._generation or self.stop_event.is_set():
+                    return
+                self._input_rate = StreamingPCM(self.settings.audio_capture_rate, API_RATE)
+                self._input_generation += 1
+                self._last_speech = self.clock()
+                self._turn_pending = False
+                self.phase = VoicePhase.LISTENING
 
     async def _playback_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -160,13 +219,16 @@ class VoiceConversation:
                     continue
                 try:
                     if chunk is None:
+                        await self._mute_input(VoicePhase.PLAYBACK_DRAINING)
                         if self.audio.playback._stream is not None:
                             await asyncio.to_thread(self.audio.playback.drain, min(5, self.settings.realtime_max_response_seconds))
                             await asyncio.sleep(self.settings.audio_buffer_duration)
                             await asyncio.to_thread(self.audio.playback.stop)
+                        await self._ready_to_listen(generation)
                         if self._current_response == response_id:
                             self._current_response = None
                             self._audio_item = None
+                            self._completed_turn = True
                         continue
                     if self.audio.playback._stream is None:
                         await asyncio.to_thread(self.audio.playback.start, chunk)
@@ -179,6 +241,7 @@ class VoiceConversation:
 
     async def _interrupt_output(self, *, cancel_server: bool = False) -> None:
         response_id = self._current_response
+        await self._mute_input(VoicePhase.PLAYBACK_DRAINING)
         if response_id:
             self._blocked.add(response_id)
         self._generation += 1
@@ -204,27 +267,50 @@ class VoiceConversation:
                 pass  # VAD may already have cancelled the response
 
     async def cancel_reply(self) -> None:
-        """Cancel only the current response; microphone capture continues."""
+        """Cancel the current reply, then safely reopen listening."""
+        if self._current_response is None:
+            return
         await self._interrupt_output(cancel_server=True)
+        await self._ready_to_listen(self._generation)
+        self._completed_turn = True
 
     async def handle_event(self, event: ConversationEvent) -> None:
         kind = event.kind
+        if kind == "input_audio_buffer.cleared":
+            self._clear_ack.set()
+            return
         if kind == "input_audio_buffer.speech_started":
-            self._last_speech = self.clock()
-            if self._current_response:
-                await self._interrupt_output()
+            if self.phase == VoicePhase.LISTENING:
+                self._last_speech = self.clock()
+                self._speech_end = None
+                self._turn_pending = True
         elif kind == "input_audio_buffer.speech_stopped":
-            self._last_speech = self.clock()
-            self._speech_end = self._last_speech
+            if self.phase in {VoicePhase.LISTENING, VoicePhase.PROCESSING}:
+                self._last_speech = self.clock()
+                self._speech_end = self._last_speech
+                await self._mute_input(VoicePhase.PROCESSING)
+            elif self.phase == VoicePhase.RESPONDING and self._speech_end is None:
+                self._speech_end = self.clock()  # response.created arrived before VAD stop
         elif kind == "response.created" and event.response_id:
-            if self._current_response and self._current_response != event.response_id:
-                await self._interrupt_output()
-            self._current_response = event.response_id
-            self._first_audio_reported = False
-            self._output_rate = StreamingPCM(API_RATE, self.settings.audio_playback_rate)
-            self._limiter = StreamingPeakLimiter(self.settings.audio_playback_gain,
-                                                  self.settings.audio_max_playback_level)
+            if event.response_id in self._blocked or event.response_id in self._finished_responses:
+                return
+            if self._current_response is not None and self._current_response != event.response_id:
+                raise VoiceError("Overlapping OpenAI responses are unsupported")
+            if self._current_response is None:
+                if self._completed_turn and not self._turn_pending:
+                    raise VoiceError("Unexpected response without a new user turn")
+                await self._mute_input(VoicePhase.RESPONDING)
+                self._current_response = event.response_id
+                self._first_audio_reported = False
+                self._output_rate = StreamingPCM(API_RATE, self.settings.audio_playback_rate)
+                self._limiter = StreamingPeakLimiter(self.settings.audio_playback_gain,
+                                                      self.settings.audio_max_playback_level)
         elif kind == "response.output_audio.delta":
+            if (event.response_id and self._current_response is None and
+                    event.response_id not in self._blocked and event.response_id not in self._finished_responses):
+                # Fail closed on event reordering: mute before accepting the first audio.
+                await self.handle_event(ConversationEvent("response.created", event.state,
+                                                          event.session_id, event.response_id))
             if (not event.response_id or event.response_id != self._current_response or
                     event.response_id in self._blocked or event.response_id in self._finished_responses):
                 return
@@ -257,6 +343,8 @@ class VoiceConversation:
                 await self._output.put((self._generation, event.response_id, None))
             elif event.status == "cancelled":
                 await self._interrupt_output()
+                await self._ready_to_listen(self._generation)
+                self._completed_turn = True
             else:
                 await self._interrupt_output()
                 raise VoiceError(f"OpenAI response {event.status or 'failed'}")
