@@ -14,7 +14,7 @@ Preview captured in headless Chromium during development. Check contrast and spa
 - No root access to run the application
 - `libportaudio2` on the Pi for microphone and speaker tests (check with `dpkg-query -W libportaudio2`)
 
-Runtime libraries are Flask, python-dotenv, psutil, requests, defusedxml, gpiozero, lgpio, sounddevice, NumPy, and websockets. `pytest` is used for development. `requirements.txt` pins direct and transitive Python packages to tested versions; it does not install system packages. GPIO and audio streams remain closed until explicitly requested.
+Runtime libraries are Flask, python-dotenv, psutil, requests, defusedxml, gpiozero, lgpio, sounddevice, NumPy, websockets, and jsonschema. `pytest` is used for development. `requirements.txt` pins direct and transitive Python packages to tested versions; it does not install system packages. GPIO and audio streams remain closed until explicitly requested.
 
 ## Project layout
 
@@ -106,6 +106,11 @@ The expected response is `{"status":"healthy"}`. Stop the foreground server with
 | `MIRROR_REALTIME_CONNECT_TIMEOUT` | `10` | Connect, send, and acknowledgment timeout, 1–60 seconds. |
 | `MIRROR_REALTIME_RETRY_LIMIT` | `2` | Additional transient connection attempts, 0–5. Authentication and protocol errors are not retried. |
 | `MIRROR_REALTIME_BACKOFF_SECONDS` | `1.0` | Initial exponential retry delay, 0.1–10 seconds. |
+| `MIRROR_TOOLS_ENABLED` | `false` | Advertise the single allowlisted read-only capability tool in a manually activated voice session. |
+| `MIRROR_TOOL_TIMEOUT_SECONDS` | `5.0` | Upper deadline per call, 0.1–30 seconds; each registered tool may impose a shorter one. |
+| `MIRROR_TOOL_CONCURRENCY` | `2` | Maximum simultaneous local tool executions, 1–4. |
+| `MIRROR_TOOL_MAX_OUTPUT_BYTES` | `1024` | Maximum structured result size, 64–8192 bytes; each tool may impose a lower limit. |
+| `MIRROR_TOOL_MAX_CALLS` | `4` | Maximum executed calls per voice session, 1–8. Later calls receive an unavailable result and tool choice is disabled for the continuation. |
 
 Pass 6A adds an explicit OpenAI Realtime connection foundation. Flask startup and page views never open an OpenAI connection, microphone, or speaker, and the assistant display stays a placeholder. The safe offline check is `.venv/bin/python -m magic_mirror.assistant.realtime_test`; live validation requires `--connect` and a local `OPENAI_API_KEY`. See [Pass 6A Realtime validation and protocol](docs/PASS6A_REALTIME.md) for exact Pi commands, event handling, cost assumptions, and limits.
 
@@ -114,6 +119,8 @@ Pass 6B adds a manually started local voice conversation through the existing `A
 Pass 6C adds an optional local wake detector. It is disabled by default and must be started with `.venv/bin/python -m magic_mirror.assistant.wake_cli --start` after setting `MIRROR_WAKE_ENABLED=true` and installing the separate `requirements-wake.txt` and model. The default phrase is **magic mirror**; `MIRROR_WAKE_PHRASE` can change it without training a custom model. While idle, only the locally selected microphone and one-thread Sherpa-ONNX keyword model run; no OpenAI client is constructed. After detection the wake stream is released immediately before Pass 6B capture starts. The local wake detector stays inactive throughout the half-duplex voice conversation, then resumes only after voice streams close and the cooldown begins. `c` + Enter manually cancels a reply, `e` + Enter ends a conversation, and `q` + Enter stops the assistant. See [Pass 6C hardware validation](docs/PASS6C_PI_VALIDATION.md) for the verified model archive, licensing, exact Pi commands and measurements.
 
 Pass 6D connects that wake process to the existing assistant region and RGB LED. Enable `MIRROR_WAKE_ENABLED=true` only after the local model and audio settings are ready, then start Flask and the wake CLI separately. The wake CLI alone owns the current assistant exchange, audio streams, and GPIO when both wake and LED are enabled. A private process lock rejects a second wake or manual voice CLI while one is active. Flask reads only a private Unix socket snapshot; `/api/assistant` serves the current state to same-origin browsers on loopback and provides no activation control, audio, API credentials, or conversation history. The browser checks it once per second while visible, rather than holding open an SSE connection; this matches the existing bounded-poll dashboard design and keeps browser refreshes independent of the assistant lifecycle. No new environment variable is needed. See [Pass 6D Pi validation](docs/PASS6D_PI_VALIDATION.md) for commands and the hardware checklist.
+
+Pass 7A adds optional read-only Realtime function calling inside that same voice session. It is off by default. With `MIRROR_TOOLS_ENABLED=true`, the model can request only the registered `get_mirror_capabilities` test tool; its response is deterministic and does not read live weather, news, Pi-hole, files, or credentials. The dispatcher validates JSON arguments against a closed schema, enforces per-tool and session limits, and returns compact status-only failures. It waits for a completed function-call response before execution, sends a `function_call_output` item with the original call ID, then requests one continuation response. Microphone upload remains muted until the spoken continuation drains and the existing acoustic buffer clear completes. Tool outputs are treated as untrusted data. No Flask route or idle wake connection executes tools. See [Pass 7A Pi validation](docs/PASS7A_PI_VALIDATION.md) for manual checks and limits.
 
 | Wake setting | Default | Purpose |
 | --- | --- | --- |

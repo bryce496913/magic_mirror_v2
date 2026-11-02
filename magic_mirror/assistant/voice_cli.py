@@ -10,7 +10,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from ..audio import AudioError
-from ..config import ConfigurationError, Settings
+from ..config import ConfigurationError, Settings, configure_logging
 from .client import RealtimeError
 from .display import acquire_owner_lock
 from .voice import Transcript, VoiceConversation, VoiceError
@@ -79,7 +79,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
     try:
-        asyncio.run(_interactive(Settings.from_env()))
+        settings = Settings.from_env()
+        configure_logging(settings.log_level)
+        asyncio.run(_interactive(settings))
     except (ConfigurationError, RealtimeError, VoiceError, AudioError, OSError, RuntimeError) as exc:
         print(f"Voice session error: {exc}", file=sys.stderr)
         return 1

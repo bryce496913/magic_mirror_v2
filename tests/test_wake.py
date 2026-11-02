@@ -191,7 +191,7 @@ def test_non_wake_audio_stays_local_and_shutdown_releases_mic():
         audio, detector = FakeAudio(), FakeDetector()
         voices = []
         now, reported = [0.0], []
-        controller = WakeController(settings(), audio=audio,
+        controller = WakeController(settings(tools_enabled=True), audio=audio,
                                     detector_factory=lambda _: detector,
                                     voice_factory=lambda *a, **k: voices.append(1),
                                     process=FakeProcess(), clock=lambda: now[0],

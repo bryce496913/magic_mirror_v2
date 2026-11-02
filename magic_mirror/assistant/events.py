@@ -30,6 +30,15 @@ class PlaybackEvent:
 
 
 @dataclass(frozen=True)
+class FunctionCall:
+    call_id: str
+    item_id: str
+    name: str
+    arguments: str | None
+    status: str | None = None
+
+
+@dataclass(frozen=True)
 class ConversationEvent:
     kind: str
     state: ConversationState
@@ -45,6 +54,9 @@ class ConversationEvent:
     usage: dict[str, Any] | None = None
     error_code: str | None = None
     content_index: int | None = None
+    tool_call: FunctionCall | None = None
+    tool_calls: tuple[FunctionCall, ...] = ()
+    tool_delta: str | None = None
 
 
 def _id(value: Any) -> str | None:
@@ -58,6 +70,7 @@ class EventTracker:
     response_started: dict[str, float] = field(default_factory=dict)
     usage: dict[str, int] = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
     _final_transcripts: set[tuple[str, str, int]] = field(default_factory=set)
+    _done_responses: set[str] = field(default_factory=set)
 
     def parse(self, raw: str | bytes | dict[str, Any], now: float) -> ConversationEvent:
         try:
@@ -80,6 +93,15 @@ class EventTracker:
         role = None
         code = None
         content_index = None
+        tool_call = None
+        tool_calls = ()
+        tool_delta = None
+
+        def function_call(source: dict[str, Any]) -> FunctionCall:
+            return FunctionCall(_id(source.get("call_id")) or "", _id(source.get("id")) or "",
+                                _id(source.get("name")) or "",
+                                source.get("arguments") if isinstance(source.get("arguments"), str) else None,
+                                _id(source.get("status")))
 
         if kind in {"session.created", "session.updated"}:
             session = payload.get("session")
@@ -104,10 +126,13 @@ class EventTracker:
         elif kind == "response.done":
             if not response_id or not isinstance(response.get("status"), str):
                 return ConversationEvent("invalid", self.state, self.session_id, event_id=event_id)
-            self.response_started.pop(response_id, None)
+            if response_id in self._done_responses:
+                return ConversationEvent("duplicate", self.state, self.session_id, response_id, event_id=event_id)
             status = response["status"]
             if status not in {"completed", "cancelled", "failed", "incomplete"}:
                 return ConversationEvent("invalid", self.state, self.session_id, event_id=event_id)
+            self.response_started.pop(response_id, None)
+            self._done_responses.add(response_id)
             if isinstance(response.get("usage"), dict):
                 usage = {k: v for k, v in response["usage"].items()
                          if k in self.usage and isinstance(v, int) and not isinstance(v, bool) and v >= 0}
@@ -116,6 +141,10 @@ class EventTracker:
             details = response.get("status_details")
             if isinstance(details, dict) and isinstance(details.get("error"), dict):
                 code = _id(details["error"].get("code")) or _id(details["error"].get("type"))
+            output = response.get("output", [])
+            if isinstance(output, list):
+                tool_calls = tuple(function_call(value) for value in output
+                                   if isinstance(value, dict) and value.get("type") == "function_call")
             self.state = ConversationState.RESPONDING if self.response_started else (ConversationState.ERROR if status == "failed" else ConversationState.READY)
         elif kind == "error":
             error = payload.get("error")
@@ -159,9 +188,25 @@ class EventTracker:
             final = True
         elif kind in {"conversation.item.added", "conversation.item.done", "response.output_item.added", "response.output_item.done"}:
             role = _id(item.get("role"))
+            if item.get("type") == "function_call":
+                tool_call = function_call(item)
+        elif kind in {"response.function_call_arguments.delta", "response.function_call_arguments.done"}:
+            call_id = _id(payload.get("call_id"))
+            if not response_id or not item_id or not call_id:
+                return ConversationEvent("invalid", self.state, self.session_id, event_id=event_id)
+            if kind.endswith(".delta"):
+                tool_delta = payload.get("delta")
+                if not isinstance(tool_delta, str):
+                    return ConversationEvent("invalid", self.state, self.session_id, event_id=event_id)
+                tool_call = FunctionCall(call_id, item_id, "", None)
+            else:
+                arguments = payload.get("arguments")
+                if not isinstance(arguments, str):
+                    return ConversationEvent("invalid", self.state, self.session_id, event_id=event_id)
+                tool_call = FunctionCall(call_id, item_id, _id(payload.get("name")) or "", arguments)
         else:
             return ConversationEvent("unknown", self.state, self.session_id, response_id, item_id, event_id)
 
         return ConversationEvent(kind, self.state, self.session_id, response_id, item_id,
                                  event_id, role, text, audio, final, status, usage, code,
-                                 content_index)
+                                 content_index, tool_call, tool_calls, tool_delta)
