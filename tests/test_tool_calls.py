@@ -164,7 +164,7 @@ def test_search_citations_wait_for_matching_spoken_audio_and_clear_on_new_turn(m
                                                 openai_api_key="fixture-only-key")
         voice.on_event = store.on_event
         voice.on_playback = store.on_playback
-        voice.on_sources = store.on_sources
+        voice.on_tool_visual = store.on_tool_visual
         task = asyncio.create_task(voice.run())
         try:
             await wait_until(lambda: audio.capture.active)
@@ -179,7 +179,8 @@ def test_search_citations_wait_for_matching_spoken_audio_and_clear_on_new_turn(m
             output = sent_outputs(client)
             assert output[0]["call_id"] == "search-id"
             assert json.loads(output[0]["output"])["data"]["sources"][0]["title"] == "Official release"
-            assert store.snapshot().sources and not store.snapshot().assistant_text
+            assert store.snapshot().tool and not store.snapshot().assistant_text
+            assert store.snapshot().tool.call_id == "search-id"
             assert voice.phase == VoicePhase.PROCESSING and audio.playback.starts == 0
             client.queue.put_nowait(event("response.created", response="spoken-search"))
             client.queue.put_nowait(event("response.output_audio.delta", response="spoken-search",
@@ -189,9 +190,9 @@ def test_search_citations_wait_for_matching_spoken_audio_and_clear_on_new_turn(m
             client.queue.put_nowait(event("response.done", response="spoken-search", status="completed"))
             await wait_until(lambda: audio.playback.starts == 1 and voice.phase == VoicePhase.LISTENING)
             assert store.snapshot().assistant_text == "Raspberry Pi reports a release."
-            assert store.snapshot().sources[0]["url"].startswith("https://")
+            assert store.snapshot().tool.sources[0].url.startswith("https://")
             client.queue.put_nowait(event("input_audio_buffer.speech_started", item="u2"))
-            await wait_until(lambda: store.snapshot().sources == ())
+            await wait_until(lambda: store.snapshot().tool is None)
         finally:
             voice.stop_event.set()
             await task
@@ -217,8 +218,8 @@ def test_search_never_runs_without_function_call_and_late_result_is_discarded(mo
         monkeypatch.setattr(WebSearch, "search", slow)
         voice, audio, client, _, _ = make_voice(tools_enabled=True, search_enabled=True,
                                                 openai_api_key="fixture-only-key")
-        seen_sources = []
-        voice.on_sources = seen_sources.append
+        seen_visual = []
+        voice.on_tool_visual = seen_visual.append
         task = asyncio.create_task(voice.run())
         await wait_until(lambda: audio.capture.active)
         client.queue.put_nowait(event("input_audio_buffer.speech_started", item="stable"))
@@ -238,9 +239,65 @@ def test_search_never_runs_without_function_call_and_late_result_is_discarded(mo
         voice.stop_event.set()
         release.set()
         await task
-        assert calls == [1] and not seen_sources
+        assert calls == [1] and not any(item is not None and item.status == "completed"
+                                        for item in seen_visual)
         assert not any(item["call_id"] == "late-call" for item in sent_outputs(client))
         assert audio.closed and client.closed
+
+    asyncio.run(scenario())
+
+
+def test_weather_tool_visual_tracks_actual_call_and_speech(monkeypatch):
+    from magic_mirror.assistant.display import AssistantStateStore
+    from magic_mirror.assistant.tools.weather import WeatherTools
+    from magic_mirror.assistant.wake import WakeState
+
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def current(_self, _arguments):
+            entered.set()
+            await release.wait()
+            return {"availability": "available", "location": "Auckland",
+                    "conditions": "Rain", "temperature": {"value": 11, "unit": "°C"},
+                    "freshness": "fresh", "precipitation_probability_percent": 70}
+
+        monkeypatch.setattr(WeatherTools, "current", current)
+        store = AssistantStateStore()
+        store.on_state(WakeState.LISTENING)
+        voice, audio, client, _, _ = make_voice(tools_enabled=True)
+        voice.on_event = store.on_event
+        voice.on_playback = store.on_playback
+        voice.on_tool_visual = store.on_tool_visual
+        task = asyncio.create_task(voice.run())
+        try:
+            await wait_until(lambda: audio.capture.active)
+            client.queue.put_nowait(event("input_audio_buffer.speech_started", item="u1"))
+            client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="u1"))
+            client.queue.put_nowait(event("response.created", response="tool-r"))
+            call = tool_call("weather-call", name="get_current_weather",
+                             arguments='{"location":"Auckland"}', item_id="tool-item")
+            client.queue.put_nowait(tool_done("tool-r", call))
+            await entered.wait()
+            snap = store.snapshot()
+            assert snap.tool.status == "loading" and snap.tool.turn_id == "u1"
+            assert snap.tool.call_id == "weather-call" and snap.tool.response_id == "tool-r"
+            release.set()
+            await wait_until(lambda: store.snapshot().tool is not None and
+                             store.snapshot().tool.status == "completed")
+            assert "Auckland" in store.snapshot().tool.title
+            assert "11°C" in store.snapshot().tool.summary
+            client.queue.put_nowait(event("response.created", response="spoken-r"))
+            client.queue.put_nowait(event("response.output_audio.delta", response="spoken-r",
+                                          item="audio", audio=pcm_audio()))
+            client.queue.put_nowait(event("response.done", response="spoken-r", status="completed"))
+            await wait_until(lambda: audio.playback.starts == 1 and voice.phase == VoicePhase.LISTENING)
+            client.queue.put_nowait(event("input_audio_buffer.speech_started", item="u2"))
+            await wait_until(lambda: store.snapshot().tool is None)
+        finally:
+            release.set()
+            voice.stop_event.set()
+            await task
 
     asyncio.run(scenario())
 

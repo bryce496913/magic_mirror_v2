@@ -43,7 +43,7 @@ async def _interactive(settings: Settings) -> None:
 
     controller = WakeController(settings, on_state=state_changed, on_metrics=metrics,
                                 on_voice_event=store.on_event, on_playback=store.on_playback,
-                                on_sources=store.on_sources)
+                                on_tool_visual=store.on_tool_visual)
     loop = asyncio.get_running_loop()
     registered_signals = []
     stdin_registered = False
