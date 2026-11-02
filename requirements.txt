@@ -1,5 +1,6 @@
 # Exact versions for Python 3.11+ on Debian 12 and development machines.
 attrs==26.1.0
+anyio==4.16.0
 blinker==1.9.0
 certifi==2026.10.23
 cffi==2.0.0
@@ -9,6 +10,9 @@ colorzero==2.0
 defusedxml==0.7.1
 Flask==3.1.2
 gpiozero==2.0.1.post3
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
 idna==3.20
 iniconfig==2.3.0
 itsdangerous==2.2.0

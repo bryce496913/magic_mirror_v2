@@ -1,6 +1,5 @@
 """Provider tests use only local fixtures and mocked read-only interfaces."""
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -208,7 +207,7 @@ def test_pihole_certificate_failure_is_not_bypassed(monkeypatch, tmp_path):
 
 
 def test_pihole_ca_does_not_change_weather_or_news_trust(monkeypatch, tmp_path):
-    from magic_mirror.providers import pihole, weather, news
+    from magic_mirror.providers import pihole, weather
     ca_cert = tmp_path / "local-ca.crt"
     ca_cert.write_text("test fixture only")
     calls = []

@@ -86,6 +86,8 @@ class Settings:
     weather_latitude: float | None = None
     weather_longitude: float | None = None
     weather_unit: str = "celsius"
+    weather_location_name: str = ""
+    voice_weather_cache_seconds: int = 600
     news_feeds: tuple[str, ...] = ()
     pihole_url: str = "http://127.0.0.1"
     pihole_password_file: str = ""
@@ -123,9 +125,9 @@ class Settings:
     realtime_retry_limit: int = 2
     realtime_backoff_seconds: float = 1.0
     tools_enabled: bool = False
-    tool_timeout_seconds: float = 5.0
+    tool_timeout_seconds: float = 15.0
     tool_concurrency: int = 2
-    tool_max_output_bytes: int = 1024
+    tool_max_output_bytes: int = 2048
     tool_max_calls: int = 4
     wake_enabled: bool = False
     wake_phrase: str = "magic mirror"
@@ -185,6 +187,11 @@ class Settings:
         unit = values.get("MIRROR_WEATHER_UNIT", "celsius").strip().lower()
         if unit not in {"celsius", "fahrenheit"}:
             raise ConfigurationError("MIRROR_WEATHER_UNIT must be celsius or fahrenheit")
+        location_name = values.get("MIRROR_WEATHER_LOCATION_NAME", "").strip()
+        if (len(location_name) > 80 or any(ord(ch) < 32 for ch in location_name)
+                or any(ch in location_name for ch in "<>/\\")):
+            raise ConfigurationError("MIRROR_WEATHER_LOCATION_NAME must be a short single-line label")
+        voice_weather_cache_seconds = _interval(values, "MIRROR_VOICE_WEATHER_CACHE_SECONDS", 600, 60)
         feeds = tuple(_url(item.strip(), "MIRROR_NEWS_FEEDS") for item in
                       values.get("MIRROR_NEWS_FEEDS", "").split(",") if item.strip())
         if len(feeds) > 5 or len(feeds) != len(set(feeds)):
@@ -252,6 +259,8 @@ class Settings:
         return cls(host=host, port=port, log_level=level, clock_format=clock_format,
                    display_scale=display_scale, enabled_modules=modules,
                    weather_latitude=latitude, weather_longitude=longitude, weather_unit=unit,
+                   weather_location_name=location_name,
+                   voice_weather_cache_seconds=voice_weather_cache_seconds,
                    news_feeds=feeds, pihole_url=pihole_url, pihole_password_file=password_file,
                    pihole_ca_cert=ca_cert,
                    system_interval=_interval(values, "MIRROR_SYSTEM_INTERVAL", 15, 5),
@@ -285,9 +294,9 @@ class Settings:
                    realtime_retry_limit=_audio_int(values, "MIRROR_REALTIME_RETRY_LIMIT", 2, 0, 5),
                    realtime_backoff_seconds=_audio_float(values, "MIRROR_REALTIME_BACKOFF_SECONDS", 1.0, 0.1, 10.0),
                    tools_enabled=_bool(values, "MIRROR_TOOLS_ENABLED", False),
-                   tool_timeout_seconds=_audio_float(values, "MIRROR_TOOL_TIMEOUT_SECONDS", 5.0, 0.1, 30.0),
+                   tool_timeout_seconds=_audio_float(values, "MIRROR_TOOL_TIMEOUT_SECONDS", 15.0, 0.1, 30.0),
                    tool_concurrency=_audio_int(values, "MIRROR_TOOL_CONCURRENCY", 2, 1, 4),
-                   tool_max_output_bytes=_audio_int(values, "MIRROR_TOOL_MAX_OUTPUT_BYTES", 1024, 64, 8192),
+                   tool_max_output_bytes=_audio_int(values, "MIRROR_TOOL_MAX_OUTPUT_BYTES", 2048, 64, 8192),
                    tool_max_calls=_audio_int(values, "MIRROR_TOOL_MAX_CALLS", 4, 1, 8),
                    wake_enabled=wake_enabled, wake_phrase=wake_phrase, wake_model_dir=wake_model_dir,
                    wake_cooldown_seconds=_audio_float(values, "MIRROR_WAKE_COOLDOWN_SECONDS", 5.0, 0.5, 30.0),

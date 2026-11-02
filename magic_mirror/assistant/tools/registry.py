@@ -13,6 +13,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from ...config import Settings
+from .weather import PERIODS, WeatherTools
 
 LOGGER = logging.getLogger(__name__)
 NAME = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
@@ -170,5 +171,27 @@ def default_registry(settings: Settings) -> ToolRegistry:
         parameters={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         enabled=settings.tools_enabled, permission=Permission.READ_ONLY, executor=_capabilities,
         timeout_seconds=2.0, max_input_bytes=128, max_output_bytes=512,
+    ))
+    weather = WeatherTools(settings)
+    location = {"type": "string", "minLength": 2, "maxLength": 80,
+                "description": "Optional city, or city and country/region. Omit for configured default."}
+    registry.register(ToolSpec(
+        name="get_current_weather",
+        description="Get current Open-Meteo model conditions, temperature, humidity and wind for a location. Never describe these as measured observations.",
+        parameters={"type": "object", "properties": {"location": location},
+                    "required": [], "additionalProperties": False},
+        enabled=settings.tools_enabled, permission=Permission.READ_ONLY,
+        executor=weather.current, timeout_seconds=15.0,
+        max_input_bytes=256, max_output_bytes=2048,
+    ))
+    registry.register(ToolSpec(
+        name="get_weather_forecast",
+        description="Get Open-Meteo forecast for today, this afternoon, tonight, tomorrow, the next weekend or seven days. Use precipitation probability for rain questions; state timeframe and location.",
+        parameters={"type": "object", "properties": {
+            "location": location, "period": {"type": "string", "enum": list(PERIODS)}},
+            "required": ["period"], "additionalProperties": False},
+        enabled=settings.tools_enabled, permission=Permission.READ_ONLY,
+        executor=weather.forecast, timeout_seconds=15.0,
+        max_input_bytes=256, max_output_bytes=2048,
     ))
     return registry

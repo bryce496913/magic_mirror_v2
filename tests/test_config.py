@@ -38,6 +38,17 @@ def test_live_module_configuration():
     assert settings.pihole_password_file == "/tmp/local-password"
 
 
+def test_voice_weather_configuration():
+    settings = Settings.from_env({"MIRROR_WEATHER_LOCATION_NAME": "Auckland, New Zealand",
+                                  "MIRROR_VOICE_WEATHER_CACHE_SECONDS": "900"})
+    assert settings.weather_location_name == "Auckland, New Zealand"
+    assert settings.voice_weather_cache_seconds == 900
+    for values in ({"MIRROR_WEATHER_LOCATION_NAME": "bad\nname"},
+                   {"MIRROR_VOICE_WEATHER_CACHE_SECONDS": "5"}):
+        with pytest.raises(ConfigurationError):
+            Settings.from_env(values)
+
+
 def test_pihole_ca_certificate_path(tmp_path):
     ca_cert = tmp_path / "local-ca.crt"
     ca_cert.write_text("test fixture only")
