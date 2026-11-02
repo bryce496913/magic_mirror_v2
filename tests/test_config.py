@@ -56,16 +56,18 @@ def test_search_is_opt_in_with_bounded_cost_configuration():
     configured = Settings.from_env({"MIRROR_SEARCH_ENABLED": "true",
         "MIRROR_SEARCH_MAX_PER_CONVERSATION": "3", "MIRROR_SEARCH_MAX_RESULTS": "2",
         "MIRROR_SEARCH_TIMEOUT_SECONDS": "9", "MIRROR_SEARCH_CACHE_SECONDS": "120",
-        "MIRROR_SEARCH_DAILY_BUDGET": "5"})
+        "MIRROR_SEARCH_DAILY_BUDGET": "5", "MIRROR_SEARCH_ESTIMATED_USD_PER_REQUEST": "0.02"})
     assert configured.search_enabled and configured.search_max_per_conversation == 3
     assert configured.search_max_results == 2 and configured.search_timeout_seconds == 9
     assert configured.search_cache_seconds == 120 and configured.search_daily_budget == 5
+    assert configured.search_estimated_usd_per_request == 0.02
     for values in ({"MIRROR_SEARCH_ENABLED": "yes"},
                    {"MIRROR_SEARCH_MAX_PER_CONVERSATION": "0"},
                    {"MIRROR_SEARCH_MAX_RESULTS": "4"},
                    {"MIRROR_SEARCH_TIMEOUT_SECONDS": "0"},
                    {"MIRROR_SEARCH_CACHE_SECONDS": "-1"},
-                   {"MIRROR_SEARCH_DAILY_BUDGET": "1001"}):
+                   {"MIRROR_SEARCH_DAILY_BUDGET": "1001"},
+                   {"MIRROR_SEARCH_ESTIMATED_USD_PER_REQUEST": "-1"}):
         with pytest.raises(ConfigurationError):
             Settings.from_env(values)
 

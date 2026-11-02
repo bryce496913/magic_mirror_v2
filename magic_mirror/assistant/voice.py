@@ -24,6 +24,8 @@ API_RATE = 24000
 CHUNK_MS = 100
 SILENCE_SECONDS = 60
 MAX_TOOL_ARGUMENT_BYTES = 4096
+MAX_TRANSCRIPT_CHARS = 2048
+MAX_TRANSCRIPT_PARTS = 8
 TOOL_AUDIO_DRAIN = object()
 LOGGER = logging.getLogger(__name__)
 
@@ -96,6 +98,7 @@ class VoiceConversation:
         self._tool_invalid: set[tuple[str, str]] = set()
         self._tool_count = 0
         self._tool_limit_reported = False
+        self._search_used_this_turn = False
         self._tool_source_response: str | None = None
         self._tool_audio_drained = asyncio.Event()
         self._tool_audio_drained.set()
@@ -377,6 +380,8 @@ class VoiceConversation:
                 return
             await self._interrupt_output()
             await self._cancel_tool_work()
+            if self.stop_event.is_set():
+                return
             await self._ready_to_listen(self._generation)
             self._completed_turn = True
             return
@@ -392,14 +397,19 @@ class VoiceConversation:
         self._completed_turn = True
 
     async def _cancel_tool_work(self) -> None:
-        task, self._tool_task = self._tool_task, None
+        task = self._tool_task
         self._tool_source_response = None
         self._awaiting_tool_response = False
         if task is not None:
             task.cancel()
             done, _ = await asyncio.wait({task}, timeout=min(1.0, self.settings.tool_timeout_seconds))
             if not done:
-                LOGGER.error("Cancelled tool task did not exit within the cleanup grace period")
+                # Keep the task owned and close this session. A non-cooperative
+                # provider must not overlap a new turn or be mistaken for gone.
+                self.stop_event.set()
+                LOGGER.error("Cancelled tool task did not exit; closing voice session")
+            elif self._tool_task is task:
+                self._tool_task = None
 
     def _record_tool_event(self, event: ConversationEvent) -> None:
         call = event.tool_call
@@ -524,13 +534,18 @@ class VoiceConversation:
             return
         self._awaiting_tool_response = True
         continuation = {"type": "response.create"}
-        if self._tool_count >= self.settings.tool_max_calls:
+        # Retrieved web text is untrusted. Its spoken continuation must not be
+        # allowed to initiate another tool cycle in the same turn.
+        if (self._tool_count >= self.settings.tool_max_calls or
+                any(call.name == "search_web" for call in calls)):
             continuation["response"] = {"tool_choice": "none", "tools": []}
         await self.client.send(continuation)
 
     async def _start_tool_calls(self, event: ConversationEvent) -> None:
         if not self._turn_pending:
             raise VoiceError("Tool call without an active user turn")
+        if self._search_used_this_turn:
+            raise VoiceError("A web search continuation cannot request more tools in the same turn")
         if self._tool_limit_reported:
             raise VoiceError("OpenAI tool call chain exceeded its limit")
         if self._tool_task is not None and self._tool_task.done():
@@ -543,6 +558,7 @@ class VoiceConversation:
         if any(call.call_id in self._tool_seen for call in calls):
             raise VoiceError("Repeated OpenAI function call ID")
         self._tool_seen.update(call.call_id for call in calls)
+        self._search_used_this_turn = any(call.name == "search_web" for call in calls)
         allowed = max(0, self.settings.tool_max_calls - self._tool_count)
         if len(calls) > allowed:
             self._tool_limit_reported = True
@@ -591,11 +607,13 @@ class VoiceConversation:
                                                       event.session_id, event.response_id))
         if kind == "input_audio_buffer.speech_started":
             if self.phase == VoicePhase.LISTENING:
+                self.transcripts.clear()  # only the current exchange is needed locally
                 self._visual_turn_id = event.item_id or ""
                 self.heard_speech = True
                 self._last_speech = self.clock()
                 self._speech_end = None
                 self._turn_pending = True
+                self._search_used_this_turn = False
             else:
                 return  # delayed speaker/VAD event cannot re-arm wake or barge in
         elif kind == "input_audio_buffer.speech_stopped":
@@ -687,8 +705,11 @@ class VoiceConversation:
             key = (event.role, event.item_id, event.content_index or 0)
             previous = self.transcripts.get(key)
             text = event.text if event.final else (previous.text if previous else "") + event.text
+            text = text[:MAX_TRANSCRIPT_CHARS]
             transcript = Transcript(event.role, event.item_id, event.response_id,
                                     event.content_index or 0, text, event.final)
+            if key not in self.transcripts and len(self.transcripts) >= MAX_TRANSCRIPT_PARTS:
+                self.transcripts.pop(next(iter(self.transcripts)))
             self.transcripts[key] = transcript
             if event.final and self.on_transcript:
                 self.on_transcript(transcript)

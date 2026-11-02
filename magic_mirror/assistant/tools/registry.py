@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -47,6 +48,19 @@ class ToolResult:
         if self.status == ToolStatus.SUCCESS and self.data is not None:
             value["data"] = self.data
         return json.dumps(value, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+
+
+@dataclass(frozen=True)
+class ToolMetrics:
+    invocations: int = 0
+    successes: int = 0
+    failures: int = 0
+    cancellations: int = 0
+    total_latency_ms: int = 0
+    max_latency_ms: int = 0
+    search_requests: int = 0
+    search_input_tokens: int = 0
+    search_output_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -118,8 +132,48 @@ class ToolDispatcher:
         self.registry = registry
         self.settings = settings
         self._slots = asyncio.Semaphore(settings.tool_concurrency)
+        self._metrics = ToolMetrics()
+        search_spec = registry.get("search_web")
+        search_owner = getattr(search_spec.executor, "__self__", None) if search_spec else None
+        self._search = search_owner if isinstance(search_owner, WebSearch) else None
+
+    def metrics(self) -> ToolMetrics:
+        return self._metrics
 
     async def execute(self, name: str, arguments: str) -> ToolResult:
+        started = time.monotonic()
+        result: ToolResult | None = None
+        try:
+            result = await self._execute(name, arguments)
+            return result
+        finally:
+            previous = self._metrics
+            latency = max(0, int((time.monotonic() - started) * 1000))
+            data = result.data if result is not None else None
+            usage = data.get("usage") if isinstance(data, dict) else None
+            usage = usage if isinstance(usage, dict) else {}
+            input_tokens = usage.get("input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+            input_tokens = input_tokens if type(input_tokens) is int and input_tokens >= 0 else 0
+            output_tokens = output_tokens if type(output_tokens) is int and output_tokens >= 0 else 0
+            search_request = name == "search_web" and isinstance(data, dict) and data.get("cache") == "miss"
+            successful = (result is not None and result.status == ToolStatus.SUCCESS and
+                          (not isinstance(data, dict) or data.get("availability", "available") == "available"))
+            cancelled = result is None or result.status == ToolStatus.CANCELLED
+            self._metrics = ToolMetrics(
+                invocations=previous.invocations + 1,
+                successes=previous.successes + successful,
+                failures=previous.failures + (result is not None and not successful and not cancelled),
+                cancellations=previous.cancellations + cancelled,
+                total_latency_ms=previous.total_latency_ms + latency,
+                max_latency_ms=max(previous.max_latency_ms, latency),
+                search_requests=(max(previous.search_requests, self._search.requests_reserved)
+                                 if self._search is not None else previous.search_requests + search_request),
+                search_input_tokens=previous.search_input_tokens + input_tokens,
+                search_output_tokens=previous.search_output_tokens + output_tokens,
+            )
+
+    async def _execute(self, name: str, arguments: str) -> ToolResult:
         spec = self.registry.get(name)
         if spec is None:
             return ToolResult(ToolStatus.TOOL_UNAVAILABLE)

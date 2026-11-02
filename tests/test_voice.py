@@ -479,6 +479,23 @@ def test_partial_transcript_is_replaced_by_final():
     asyncio.run(scenario())
 
 
+def test_transcripts_keep_only_current_bounded_exchange():
+    async def scenario():
+        voice, _, _, _, _ = make_voice()
+        voice.phase = VoicePhase.LISTENING
+        for number in range(3):
+            item = f"user-{number}"
+            await voice.handle_event(event("input_audio_buffer.speech_started", item=item))
+            await voice.handle_event(event("conversation.item.input_audio_transcription.completed",
+                                           item=item, role="user", text="private" * 500, final=True))
+            assert len(voice.transcripts) == 1
+            assert voice.transcripts[("user", item, 0)].text == ("private" * 500)[:2048]
+        assert ("user", "user-0", 0) not in voice.transcripts
+        await voice.close()
+
+    asyncio.run(scenario())
+
+
 def test_failure_disconnect_and_restart_cleanup():
     async def scenario():
         for failure in (event("response.done", response="r", status="failed"),
