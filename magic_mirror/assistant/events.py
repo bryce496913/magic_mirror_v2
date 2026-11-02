@@ -1,6 +1,7 @@
 """Typed, content-free-by-default state tracking for GA Realtime server events."""
 
 import json
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -61,6 +62,13 @@ class ConversationEvent:
 
 def _id(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _error_code(value: Any) -> str | None:
+    """Accept only short symbolic codes in errors that may reach logs or CLI."""
+    if value is None:
+        return None
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value) else "unrecognized_error"
 
 
 @dataclass
@@ -140,7 +148,7 @@ class EventTracker:
                     self.usage[key] += value
             details = response.get("status_details")
             if isinstance(details, dict) and isinstance(details.get("error"), dict):
-                code = _id(details["error"].get("code")) or _id(details["error"].get("type"))
+                code = _error_code(details["error"].get("code") or details["error"].get("type"))
             output = response.get("output", [])
             if isinstance(output, list):
                 tool_calls = tuple(function_call(value) for value in output
@@ -150,7 +158,7 @@ class EventTracker:
             error = payload.get("error")
             if not isinstance(error, dict):
                 return ConversationEvent("invalid", self.state, self.session_id, event_id=event_id)
-            code = _id(error.get("code")) or _id(error.get("type"))
+            code = _error_code(error.get("code") or error.get("type"))
             status = "error"
             # Server errors are often recoverable; the caller decides whether to close.
         elif kind in {"conversation.item.input_audio_transcription.delta",

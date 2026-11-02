@@ -100,7 +100,9 @@ class DailyBudget:
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode) or os.fstat(fd).st_mode & 0o077:
                 raise SearchFailure("budget_unavailable")
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            # A cancelled asyncio.to_thread call cannot stop a thread waiting in flock.
+            # Fail closed instead of leaving a budget worker behind after shutdown.
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             data = os.read(fd, 1025)
             if len(data) > 1024:
                 raise SearchFailure("budget_unavailable")
@@ -144,6 +146,11 @@ class WebSearch:
         self._used = 0
         self._daily_remaining: int | None = None
         self._cache: dict[tuple[str, str, int], CacheEntry] = {}
+
+    @property
+    def requests_reserved(self) -> int:
+        """Upper bound on billable searches, including cancelled/failed requests."""
+        return self._used
 
     async def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {self.settings.openai_api_key}",
@@ -262,7 +269,7 @@ class WebSearch:
                   "retrieved_at": self.now().astimezone(timezone.utc).isoformat(),
                   "confidence": "cited_not_independently_verified",
                   "usage": {key: value for key in ("input_tokens", "output_tokens")
-                            if isinstance((value := usage.get(key)), int) and 0 <= value <= 1000000}}
+                            if type(value := usage.get(key)) is int and 0 <= value <= 1000000}}
         maximum = min(1800, self.settings.tool_max_output_bytes - 120)
         while len(json.dumps({"status": "success", "data": result}).encode()) > maximum and len(sources) > 1:
             sources.pop()

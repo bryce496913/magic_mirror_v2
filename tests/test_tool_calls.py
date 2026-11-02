@@ -178,6 +178,8 @@ def test_search_citations_wait_for_matching_spoken_audio_and_clear_on_new_turn(m
             await wait_until(lambda: any(x["type"] == "response.create" for x in client.sent))
             output = sent_outputs(client)
             assert output[0]["call_id"] == "search-id"
+            assert next(x for x in client.sent if x["type"] == "response.create")["response"] == {
+                "tool_choice": "none", "tools": []}
             assert json.loads(output[0]["output"])["data"]["sources"][0]["title"] == "Official release"
             assert store.snapshot().tool and not store.snapshot().assistant_text
             assert store.snapshot().tool.call_id == "search-id"
@@ -619,6 +621,36 @@ def test_timeout_provider_failure_output_budget_and_no_secret_logging(caplog):
     assert "RuntimeError" in caplog.text and secret not in caplog.text
 
 
+def test_tool_metrics_are_bounded_counters_without_arguments_or_results():
+    async def success(arguments):
+        return {"word": arguments["word"]}
+
+    async def scenario():
+        dispatcher = ToolDispatcher(tool_registry(success), Settings(tools_enabled=True))
+        assert (await dispatcher.execute("safe_echo", '{"word":"private text"}')).status == ToolStatus.SUCCESS
+        assert (await dispatcher.execute("missing", "{}")).status == ToolStatus.TOOL_UNAVAILABLE
+        assert (await dispatcher.execute("safe_echo", '{"word":"too long to be accepted"}')).status == ToolStatus.INVALID_ARGUMENTS
+        metrics = dispatcher.metrics()
+        assert (metrics.invocations, metrics.successes, metrics.failures, metrics.cancellations) == (3, 1, 2, 0)
+        assert metrics.total_latency_ms >= metrics.max_latency_ms >= 0
+        assert "private text" not in repr(metrics)
+
+    asyncio.run(scenario())
+
+
+def test_web_result_cannot_request_another_tool_in_same_turn():
+    async def scenario():
+        voice, _, _, _, _ = make_voice(tools_enabled=True, search_enabled=True,
+                                      openai_api_key="fixture-only-key")
+        voice._turn_pending = True
+        voice._search_used_this_turn = True
+        with pytest.raises(VoiceError, match="web search continuation"):
+            await voice._start_tool_calls(tool_done("next", tool_call("next-call")))
+        assert voice.tool_dispatcher.metrics().invocations == 0
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("failure,expected", [("timeout", "timeout"),
                                              ("exception", "provider_failure")])
 def test_realtime_tool_failure_returns_status_then_continues(failure, expected):
@@ -666,14 +698,48 @@ def test_cancel_during_tool_execution_drops_late_result_and_restores_listening()
         client.queue.put_nowait(tool_done("r1", tool_call("c1", name="safe_echo",
                                                        arguments='{"word":"ok"}')))
         await asyncio.wait_for(started.wait(), 1)
-        await asyncio.wait_for(voice.cancel_reply(), 0.3)
-        assert voice.phase == VoicePhase.LISTENING and not sent_outputs(client)
+        cancellation = asyncio.create_task(voice.cancel_reply())
+        await asyncio.sleep(0.01)
         release.set()
+        await asyncio.wait_for(cancellation, 0.3)
+        assert voice.phase == VoicePhase.LISTENING and not sent_outputs(client)
         await asyncio.sleep(0.02)
         assert not any(x["type"] == "response.create" for x in client.sent)
         voice.stop_event.set()
         await task
         assert audio.closed and client.closed
+    asyncio.run(scenario())
+
+
+def test_noncooperative_tool_cancellation_closes_session_without_new_turn():
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def executor(_):
+            started.set()
+            while not release.is_set():
+                try:
+                    await asyncio.wait_for(release.wait(), 0.01)
+                except (asyncio.CancelledError, TimeoutError):
+                    continue  # emulate a provider that ignores cancellation
+            return {"word": "late"}
+
+        voice, audio, client, _, _ = make_voice(tools_enabled=True, tool_timeout_seconds=0.1,
+                                                tool_registry=tool_registry(executor, timeout=1))
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user"))
+        client.queue.put_nowait(event("response.created", response="r1"))
+        client.queue.put_nowait(tool_done("r1", tool_call("c1", name="safe_echo",
+                                                       arguments='{"word":"ok"}')))
+        await asyncio.wait_for(started.wait(), 1)
+        await asyncio.wait_for(voice.cancel_reply(), 0.5)
+        assert voice.stop_event.is_set()
+        assert voice._tool_task is not None
+        release.set()
+        await asyncio.wait_for(task, 1)
+        assert not sent_outputs(client) and audio.closed and client.closed
+
     asyncio.run(scenario())
 
 
