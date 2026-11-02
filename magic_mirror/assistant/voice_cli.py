@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import signal
 import sys
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -11,6 +12,7 @@ from dotenv import load_dotenv
 from ..audio import AudioError
 from ..config import ConfigurationError, Settings
 from .client import RealtimeError
+from .display import acquire_owner_lock
 from .voice import Transcript, VoiceConversation, VoiceError
 
 
@@ -21,7 +23,12 @@ async def _interactive(settings: Settings) -> None:
     def latency(seconds: float) -> None:
         print(f"Speech-end to first audio received: {seconds:.2f}s", flush=True)
 
-    voice = VoiceConversation(settings, on_transcript=transcript, on_latency=latency)
+    owner_fd = acquire_owner_lock()
+    try:
+        voice = VoiceConversation(settings, on_transcript=transcript, on_latency=latency)
+    except BaseException:
+        os.close(owner_fd)
+        raise
     loop = asyncio.get_running_loop()
     queued_commands: set[asyncio.Task] = set()
 
@@ -59,6 +66,7 @@ async def _interactive(settings: Settings) -> None:
             task.cancel()
         if queued_commands:
             await asyncio.gather(*queued_commands, return_exceptions=True)
+        os.close(owner_fd)
         print("Voice session ended; audio streams released", flush=True)
 
 
@@ -72,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
     try:
         asyncio.run(_interactive(Settings.from_env()))
-    except (ConfigurationError, RealtimeError, VoiceError, AudioError, OSError) as exc:
+    except (ConfigurationError, RealtimeError, VoiceError, AudioError, OSError, RuntimeError) as exc:
         print(f"Voice session error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

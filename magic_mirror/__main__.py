@@ -3,6 +3,7 @@
 import logging
 import signal
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -25,7 +26,9 @@ def main() -> int:
     configure_logging(settings.log_level)
     logger = logging.getLogger("magic_mirror")
     data = DashboardData(settings)
-    led = RGBLedController(settings) if settings.led_enabled else None
+    # The explicitly started wake CLI is the sole GPIO owner in assistant mode.
+    led = (RGBLedController(replace(settings, led_initial_state="off"))
+           if settings.led_enabled and not settings.wake_enabled else None)
     audio = AudioManager(settings)
     app = create_app(settings, data, led=led, audio=audio)
     # Werkzeug handles Ctrl+C itself; make a manual SIGTERM follow the same path.
