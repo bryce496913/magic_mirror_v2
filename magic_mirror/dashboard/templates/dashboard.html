@@ -73,7 +73,14 @@
       <p class="module-detail" data-role="detail">Conversation will appear here.</p>
       <p class="assistant-transcript" data-role="user-transcript" hidden></p>
       <p class="assistant-transcript assistant-answer" data-role="assistant-transcript" hidden></p>
-      <div class="assistant-sources" data-role="assistant-sources" hidden></div>
+      <div class="assistant-tool-slot">
+        <div class="assistant-tool" data-role="assistant-tool" hidden>
+          <p class="assistant-tool-title" data-role="tool-title"></p>
+          <p class="assistant-tool-summary" data-role="tool-summary"></p>
+          <p class="assistant-tool-detail" data-role="tool-detail"></p>
+          <div class="assistant-tool-sources" data-role="tool-sources"></div>
+        </div>
+      </div>
     </section>
     {% endif %}
     <p class="app-status">Application status: Running</p>

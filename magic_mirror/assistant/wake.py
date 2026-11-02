@@ -16,6 +16,7 @@ from ..config import Settings, WAKE_MODEL_FILES, WAKE_MODEL_STEM
 from .client import RealtimeError
 from .events import ConversationEvent, PlaybackEvent
 from .voice import VoiceConversation, VoiceError
+from .tool_visual import ToolVisual
 
 READ_MS = 100
 MAX_RECOVERY_ATTEMPTS = 3
@@ -158,7 +159,7 @@ class WakeController:
                  on_metrics: Callable[[WakeMetrics], None] | None = None,
                  on_voice_event: Callable[[ConversationEvent], None] | None = None,
                  on_playback: Callable[[PlaybackEvent], None] | None = None,
-                 on_sources: Callable[[tuple[dict[str, str], ...]], None] | None = None):
+                 on_tool_visual: Callable[[ToolVisual | None], None] | None = None):
         self.settings = settings
         self.audio = audio or AudioManager(settings, enabled=True)
         self.detector_factory = detector_factory
@@ -170,7 +171,7 @@ class WakeController:
         self.on_metrics = on_metrics
         self.on_voice_event = on_voice_event
         self.on_playback = on_playback
-        self.on_sources = on_sources
+        self.on_tool_visual = on_tool_visual
         self.state = WakeState.STOPPED
         self.stop_event = asyncio.Event()
         self.detector = None
@@ -240,6 +241,12 @@ class WakeController:
         if self.on_playback:
             self.on_playback(event)
 
+    def _tool_visual(self, visual: ToolVisual | None) -> None:
+        if visual is not None and visual.status == "loading":
+            self._state(WakeState.PROCESSING)
+        if self.on_tool_visual:
+            self.on_tool_visual(visual)
+
     async def _activate(self) -> None:
         """Keep draining local wake capture until the voice session is configured."""
         drain_stop = asyncio.Event()
@@ -270,7 +277,8 @@ class WakeController:
                 self.settings, audio=self.audio, before_capture=handoff,
                 first_speech_seconds=self.settings.wake_first_speech_seconds,
                 on_event=self._voice_event, on_ready=lambda: self._state(WakeState.LISTENING),
-                on_playback=self._playback_event, on_sources=self.on_sources,
+                on_playback=self._playback_event,
+                on_tool_visual=self._tool_visual,
             )
         except Exception:
             drain_stop.set()

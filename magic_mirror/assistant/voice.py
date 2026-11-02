@@ -17,6 +17,7 @@ from ..config import Settings
 from .client import RealtimeClient, RealtimeError
 from .events import ConversationEvent, FunctionCall, PlaybackAction, PlaybackEvent
 from .resample import StreamingPCM, StreamingPeakLimiter
+from .tool_visual import ToolVisual, completed as visual_completed, loading as visual_loading
 from .tools import ToolDispatcher, ToolResult, ToolStatus, ToolRegistry, default_registry
 
 API_RATE = 24000
@@ -65,7 +66,7 @@ class VoiceConversation:
                  on_latency: Callable[[float], None] | None = None,
                  on_event: Callable[[ConversationEvent], None] | None = None,
                  on_playback: Callable[[PlaybackEvent], None] | None = None,
-                 on_sources: Callable[[tuple[dict[str, str], ...]], None] | None = None,
+                 on_tool_visual: Callable[[ToolVisual | None], None] | None = None,
                  before_capture: Callable[[], Awaitable[None]] | None = None,
                  on_ready: Callable[[], None] | None = None,
                  first_speech_seconds: float | None = None,
@@ -78,7 +79,8 @@ class VoiceConversation:
         self.on_latency = on_latency
         self.on_event = on_event
         self.on_playback = on_playback
-        self.on_sources = on_sources
+        self.on_tool_visual = on_tool_visual
+        self._visual_turn_id = ""
         self.before_capture = before_capture
         self.on_ready = on_ready
         self.first_speech_seconds = first_speech_seconds
@@ -341,6 +343,8 @@ class VoiceConversation:
         if response_id:
             self._blocked.add(response_id)
         self._generation += 1
+        if self.on_tool_visual is not None:
+            self.on_tool_visual(None)
         while not self._output.empty():
             self._output.get_nowait()
         item_id = self._audio_item
@@ -511,11 +515,11 @@ class VoiceConversation:
             self._tool_output_started = True
             await self.client.send({"type": "conversation.item.create", "item": {
                 "type": "function_call_output", "call_id": call.call_id, "output": result.json()}})
-            if call.name == "search_web" and self.on_sources is not None:
-                sources = result.data.get("sources", []) if result.data and result.status == ToolStatus.SUCCESS else []
-                self.on_sources(tuple({"title": item.get("title") or item["source_name"], "url": item["url"]}
-                                      for item in sources if isinstance(item, dict) and
-                                      isinstance(item.get("url"), str) and isinstance(item.get("source_name"), str)))
+            if self.on_tool_visual is not None:
+                visual = visual_completed(call.name, self._visual_turn_id, call.call_id,
+                                          self._tool_source_response or "", result.status.value, result.data)
+                if visual is not None:
+                    self.on_tool_visual(visual)
         if generation != self._generation or self.stop_event.is_set():
             return
         self._awaiting_tool_response = True
@@ -552,6 +556,11 @@ class VoiceConversation:
             self._tool_audio_drained.set()
         self._current_response = None
         self._tool_source_response = event.response_id
+        if self.on_tool_visual is not None:
+            for call in calls[:allowed]:
+                visual = visual_loading(call.name, self._visual_turn_id, call.call_id, event.response_id or "")
+                if visual is not None:
+                    self.on_tool_visual(visual)
         task = asyncio.create_task(self._run_tool_calls(calls, self._generation, allowed))
         self._tool_task = task
         task.add_done_callback(self._tool_task_done)
@@ -582,6 +591,7 @@ class VoiceConversation:
                                                       event.session_id, event.response_id))
         if kind == "input_audio_buffer.speech_started":
             if self.phase == VoicePhase.LISTENING:
+                self._visual_turn_id = event.item_id or ""
                 self.heard_speech = True
                 self._last_speech = self.clock()
                 self._speech_end = None

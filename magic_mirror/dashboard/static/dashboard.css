@@ -52,8 +52,15 @@ p, h2 { margin: 0; }
 .assistant .module-detail { max-width: 60rem; margin-inline: auto; }
 .assistant-transcript { max-width: 60rem; margin: 0.3rem auto 0; color: #d4d4d4; font-size: clamp(0.95rem, 1.6vw, 1.35rem); line-height: 1.25; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow-wrap: anywhere; }
 .assistant-answer { color: #fff; }
-.assistant-sources { max-width: 60rem; margin: 0.25rem auto 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 0.8rem; }
-.assistant-sources a { color: #aaa; margin-inline: 0.35rem; }
+.assistant-tool-slot { min-height: clamp(6.5rem, 13vh, 8rem); max-width: 60rem; margin: 0.35rem auto 0; }
+.assistant-tool { overflow: hidden; color: #d4d4d4; }
+.assistant-tool-title { color: #fff; font-size: clamp(0.95rem, 1.6vw, 1.25rem); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.assistant-tool-summary { font-size: clamp(0.85rem, 1.3vw, 1.05rem); line-height: 1.2; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow-wrap: anywhere; }
+.assistant-tool-detail { color: #aaa; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.assistant-tool-sources { display: flex; justify-content: center; gap: 0.6rem; overflow: hidden; font-size: 0.95rem; }
+.assistant-tool-sources a { color: #d4d4d4; min-width: 0; flex: 1; overflow: hidden; text-decoration: underline; }
+.assistant-tool-sources a span, .assistant-tool-sources a small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.assistant-tool-sources a small { color: #aaa; font-size: 0.85rem; text-decoration: none; }
 .app-status { color: #666666; font-size: 0.75rem; text-align: center; }
 @media (max-width: 700px) {
   .mirror { gap: 1.25rem; padding: 1.25rem; }
