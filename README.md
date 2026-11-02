@@ -108,11 +108,17 @@ The expected response is `{"status":"healthy"}`. Stop the foreground server with
 | `MIRROR_REALTIME_CONNECT_TIMEOUT` | `10` | Connect, send, and acknowledgment timeout, 1–60 seconds. |
 | `MIRROR_REALTIME_RETRY_LIMIT` | `2` | Additional transient connection attempts, 0–5. Authentication and protocol errors are not retried. |
 | `MIRROR_REALTIME_BACKOFF_SECONDS` | `1.0` | Initial exponential retry delay, 0.1–10 seconds. |
-| `MIRROR_TOOLS_ENABLED` | `false` | Advertise the allowlisted read-only capability and weather tools in an activated voice session. |
+| `MIRROR_TOOLS_ENABLED` | `false` | Advertise allowlisted read-only tools in an activated voice session. Web search also needs its own opt-in. |
 | `MIRROR_TOOL_TIMEOUT_SECONDS` | `15.0` | Upper deadline per call, 0.1–30 seconds; each registered tool may impose a shorter one. |
 | `MIRROR_TOOL_CONCURRENCY` | `2` | Maximum simultaneous local tool executions, 1–4. |
 | `MIRROR_TOOL_MAX_OUTPUT_BYTES` | `2048` | Maximum structured result size, 64–8192 bytes; each tool may impose a lower limit. |
 | `MIRROR_TOOL_MAX_CALLS` | `4` | Maximum executed calls per voice session, 1–8. Later calls receive an unavailable result and tool choice is disabled for the continuation. |
+| `MIRROR_SEARCH_ENABLED` | `false` | Advertise `search_web` only with `MIRROR_TOOLS_ENABLED=true`; uses the private `OPENAI_API_KEY`. |
+| `MIRROR_SEARCH_MAX_PER_CONVERSATION` | `2` | Maximum paid search requests in one active conversation, 1–4. |
+| `MIRROR_SEARCH_MAX_RESULTS` | `3` | Maximum cited sources forwarded to voice and dashboard, 1–3. |
+| `MIRROR_SEARCH_TIMEOUT_SECONDS` | `12.0` | Total Responses API search deadline, 2–30 seconds; global tool timeout may be lower. |
+| `MIRROR_SEARCH_CACHE_SECONDS` | `300` | In-memory cache freshness for repeated queries within one conversation, 0–3600 seconds. |
+| `MIRROR_SEARCH_DAILY_BUDGET` | `10` | UTC-day request ceiling stored as a count in ignored `.private/`; `0` disables this ceiling. |
 
 Pass 6A adds an explicit OpenAI Realtime connection foundation. Flask startup and page views never open an OpenAI connection, microphone, or speaker, and the assistant display stays a placeholder. The safe offline check is `.venv/bin/python -m magic_mirror.assistant.realtime_test`; live validation requires `--connect` and a local `OPENAI_API_KEY`. See [Pass 6A Realtime validation and protocol](docs/PASS6A_REALTIME.md) for exact Pi commands, event handling, cost assumptions, and limits.
 
@@ -125,6 +131,8 @@ Pass 6D connects that wake process to the existing assistant region and RGB LED.
 Pass 7A adds optional read-only Realtime function calling inside that same voice session. It is off by default. With `MIRROR_TOOLS_ENABLED=true`, the model can request `get_mirror_capabilities`, `get_current_weather`, or `get_weather_forecast`. The dispatcher validates JSON arguments against a closed schema, enforces per-tool and session limits, and returns compact status-only failures. It waits for a completed function-call response before execution, sends a `function_call_output` item with the original call ID, then requests one continuation response. Microphone upload remains muted until the spoken continuation drains and the existing acoustic buffer clear completes. Tool outputs are treated as untrusted data. No Flask route or idle wake connection executes tools. See [Pass 7A Pi validation](docs/PASS7A_PI_VALIDATION.md) for foundation checks and [Pass 7B Pi validation](docs/PASS7B_PI_VALIDATION.md) for live weather checks.
 
 Voice weather reuses the dashboard's configured coordinates, `MIRROR_WEATHER_UNIT`, and Open-Meteo condition descriptions. It fetches up to eight days of hourly and daily forecast data only after a weather tool call, without changing the dashboard's refresh schedule. City names are resolved through Open-Meteo geocoding; ambiguous matches return candidates instead of silently choosing a place. The 10-minute default in-memory cache is per active conversation; failed refreshes may use data for up to 30 minutes beyond the configured freshness window and mark it `stale`. Current conditions are Open-Meteo model estimates, not direct sensor observations. Forecasts include the queried place's timezone and period. The free Open-Meteo API is for **non-commercial use only** and requires attribution; commercial deployment needs the provider's licensed customer API. See [weather source decision](docs/PASS7B_WEATHER_SOURCE.md) for terms and limitations.
+
+Pass 7C adds optional `search_web` for current questions. After a Realtime function call, a local adapter makes one bounded Responses API request with hosted `web_search`, `gpt-5.4-mini`, `store=false`, and at most one hosted search call. The adapter forwards only a short summary with verified citation associations, source metadata, safe status codes, and count/token metrics. It does not fetch arbitrary URLs. Search is disabled by default and has separate per-conversation and persistent daily request limits. Cited links appear beside the current assistant transcript on the loopback dashboard and clear with a new turn, interruption, or shutdown. The Pi must verify actual speech accuracy, source relevance, and latency. See [search architecture and costs](docs/PASS7C_SEARCH_SOURCE.md) and [Pass 7C Pi validation](docs/PASS7C_PI_VALIDATION.md).
 
 | Wake setting | Default | Purpose |
 | --- | --- | --- |

@@ -143,6 +143,108 @@ def test_weather_result_correlates_with_spoken_continuation(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_search_citations_wait_for_matching_spoken_audio_and_clear_on_new_turn(monkeypatch):
+    from magic_mirror.assistant.display import AssistantStateStore
+    from magic_mirror.assistant.tools.search import WebSearch
+    from magic_mirror.assistant.wake import WakeState
+
+    async def search(_self, arguments):
+        assert arguments == {"query": "latest Raspberry Pi OS release"}
+        return {"availability": "available", "summary": "Release announced [1].",
+                "sources": [{"title": "Official release", "url": "https://www.raspberrypi.com/news/release/",
+                             "source_name": "www.raspberrypi.com"}],
+                "citations": [{"source": 0, "start": 18, "end": 21}]}
+
+    monkeypatch.setattr(WebSearch, "search", search)
+
+    async def scenario():
+        store = AssistantStateStore()
+        store.on_state(WakeState.LISTENING)
+        voice, audio, client, _, _ = make_voice(tools_enabled=True, search_enabled=True,
+                                                openai_api_key="fixture-only-key")
+        voice.on_event = store.on_event
+        voice.on_playback = store.on_playback
+        voice.on_sources = store.on_sources
+        task = asyncio.create_task(voice.run())
+        try:
+            await wait_until(lambda: audio.capture.active)
+            assert "search_web" in {x["name"] for x in client.sent[0]["session"]["tools"]}
+            client.queue.put_nowait(event("input_audio_buffer.speech_started", item="u1"))
+            client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="u1"))
+            client.queue.put_nowait(event("response.created", response="search-call"))
+            call = tool_call("search-id", name="search_web",
+                             arguments='{"query":"latest Raspberry Pi OS release"}', item_id="search-item")
+            client.queue.put_nowait(tool_done("search-call", call))
+            await wait_until(lambda: any(x["type"] == "response.create" for x in client.sent))
+            output = sent_outputs(client)
+            assert output[0]["call_id"] == "search-id"
+            assert json.loads(output[0]["output"])["data"]["sources"][0]["title"] == "Official release"
+            assert store.snapshot().sources and not store.snapshot().assistant_text
+            assert voice.phase == VoicePhase.PROCESSING and audio.playback.starts == 0
+            client.queue.put_nowait(event("response.created", response="spoken-search"))
+            client.queue.put_nowait(event("response.output_audio.delta", response="spoken-search",
+                                          item="audio", audio=pcm_audio()))
+            client.queue.put_nowait(event("response.output_audio_transcript.done", response="spoken-search",
+                                          item="audio", role="assistant", text="Raspberry Pi reports a release.", final=True))
+            client.queue.put_nowait(event("response.done", response="spoken-search", status="completed"))
+            await wait_until(lambda: audio.playback.starts == 1 and voice.phase == VoicePhase.LISTENING)
+            assert store.snapshot().assistant_text == "Raspberry Pi reports a release."
+            assert store.snapshot().sources[0]["url"].startswith("https://")
+            client.queue.put_nowait(event("input_audio_buffer.speech_started", item="u2"))
+            await wait_until(lambda: store.snapshot().sources == ())
+        finally:
+            voice.stop_event.set()
+            await task
+
+    asyncio.run(scenario())
+
+
+def test_search_never_runs_without_function_call_and_late_result_is_discarded(monkeypatch):
+    from magic_mirror.assistant.tools.search import WebSearch
+
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        async def slow(_self, _arguments):
+            calls.append(1)
+            entered.set()
+            await release.wait()
+            return {"availability": "available", "summary": "Late [1].", "sources": [{
+                "title": "Late source", "url": "https://example.org/late",
+                "source_name": "example.org"}]}
+
+        monkeypatch.setattr(WebSearch, "search", slow)
+        voice, audio, client, _, _ = make_voice(tools_enabled=True, search_enabled=True,
+                                                openai_api_key="fixture-only-key")
+        seen_sources = []
+        voice.on_sources = seen_sources.append
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        client.queue.put_nowait(event("input_audio_buffer.speech_started", item="stable"))
+        client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="stable"))
+        client.queue.put_nowait(event("response.created", response="stable-answer"))
+        client.queue.put_nowait(event("response.output_audio.delta", response="stable-answer",
+                                      item="audio", audio=pcm_audio()))
+        client.queue.put_nowait(event("response.done", response="stable-answer", status="completed"))
+        await wait_until(lambda: voice.phase == VoicePhase.LISTENING and audio.playback.starts == 1)
+        assert calls == []
+        client.queue.put_nowait(event("input_audio_buffer.speech_started", item="recent"))
+        client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="recent"))
+        client.queue.put_nowait(event("response.created", response="search-call"))
+        client.queue.put_nowait(tool_done("search-call", tool_call("late-call", name="search_web",
+            arguments='{"query":"latest release"}', item_id="late-item")))
+        await entered.wait()
+        voice.stop_event.set()
+        release.set()
+        await task
+        assert calls == [1] and not seen_sources
+        assert not any(item["call_id"] == "late-call" for item in sent_outputs(client))
+        assert audio.closed and client.closed
+
+    asyncio.run(scenario())
+
+
 def test_audio_before_function_call_drains_before_tool_continuation():
     class GatedPlayback(FakePlayback):
         def __init__(self):

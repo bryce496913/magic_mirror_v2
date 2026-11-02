@@ -13,6 +13,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from ...config import Settings
+from .search import FRESHNESS, WebSearch
 from .weather import PERIODS, WeatherTools
 
 LOGGER = logging.getLogger(__name__)
@@ -193,5 +194,19 @@ def default_registry(settings: Settings) -> ToolRegistry:
         enabled=settings.tools_enabled, permission=Permission.READ_ONLY,
         executor=weather.forecast, timeout_seconds=15.0,
         max_input_bytes=256, max_output_bytes=2048,
+    ))
+    search = WebSearch(settings)
+    registry.register(ToolSpec(
+        name="search_web",
+        description=("Search current public web information once for recent news, events, releases, or changing facts. "
+                     "Use only when up-to-date sources are needed; cite sources and explain uncertainty."),
+        parameters={"type": "object", "properties": {
+            "query": {"type": "string", "minLength": 3, "maxLength": 160},
+            "freshness": {"type": "string", "enum": list(FRESHNESS)},
+            "max_results": {"type": "integer", "minimum": 1, "maximum": settings.search_max_results}},
+            "required": ["query"], "additionalProperties": False},
+        enabled=settings.tools_enabled and settings.search_enabled,
+        permission=Permission.READ_ONLY, executor=search.search,
+        timeout_seconds=30.0, max_input_bytes=512, max_output_bytes=2048,
     ))
     return registry
