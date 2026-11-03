@@ -79,6 +79,27 @@ Wake once and ask the same capabilities question. Read only these diagnostic lin
 
 The expected successful path is `Function-call requested` → `Function-call completion detected` → `validation accepted` → `execution started` → `execution result (success)` → `Function output submitted (status=success)` → `Response continuation requested` → a completed response with zero function calls → audible reply → green listening after playback drain. If the stage stops after output submission, continuation send failed. If it stops after continuation requested, record the next sanitized response status or transport reason and the elapsed time. Share only the stage lines, their order, sanitized codes, and whether the LED returned to white idle. The diagnostics deliberately omit call IDs, arguments, function output, raw audio, transcripts, headers, keys and full provider payloads. Press `e` then Enter to sleep, `q` then Enter or Ctrl+C to stop, and verify the microphone, speaker and GPIO are released. Do not repeatedly make paid calls solely to obtain a trace.
 
+## Dashboard transcript retest
+
+The subsequent Pi run confirmed a successful capabilities call, function output, spoken continuation, audible answer, and LED transition, but the dashboard showed **Assistant unavailable**. That label means the browser could not obtain a usable `/api/assistant` snapshot; it does not establish that the Realtime transcript was missing. Two code gaps were reproduced with hardware-free tests and fixed here: a completed audio transcript present only in `response.done` was discarded by the parser, and a fully bounded Unicode exchange could exceed the state socket's old 2 KiB read limit. The socket now permits at most 8 KiB and still rejects oversized snapshots. The exact Pi-side read failure remains to be identified at hardware retest.
+
+Keep Flask and the wake CLI running in separate foreground terminals, and open Chromium at `http://127.0.0.1:5000/` on the Pi. Ask the capabilities question once. During the audible answer and again just after the LED returns to green, run this in a third terminal. It reports state and text length without printing the private transcript:
+
+```bash
+cd ~/magic_mirror_v2
+.venv/bin/python - <<'PY'
+import json
+from urllib.request import urlopen
+with urlopen('http://127.0.0.1:5000/api/assistant', timeout=3) as response:
+    value = json.load(response)
+    print('HTTP:', response.status, 'state:', value.get('state'),
+          'assistant characters:', len(value.get('assistant_text', '')),
+          'read status:', response.headers.get('X-Mirror-Assistant-Read-Status', 'ok'))
+PY
+```
+
+A positive assistant character count with `read status: ok` means the state socket supplied an answer; refresh Chromium and check the local browser origin and rendering. `state: unavailable` comes with a safe read-status header: `socket_missing` suggests the wake CLI exited or is using a different checkout, `socket_refused` suggests a stale socket, `socket_denied` indicates local permissions, `socket_timeout` indicates a delayed reader/server, and `invalid_snapshot` indicates an invalid or oversized payload. Check that the wake CLI is still running and that `.private/assistant-state.sock` exists; do not remove or replace private files as part of this test. If the endpoint is forbidden, verify Chromium is using the Pi's loopback URL, not a LAN hostname. Share only the HTTP code, state, character count, read-status value, and whether the LED was green or white. A completed answer should remain visible while the active conversation is listening and clear when it returns to idle or is stopped.
+
 ## Limits and privacy
 
 - Only `get_mirror_capabilities` is registered in this pass. It returns a static list, not live status. Weather and web search are not tools yet.

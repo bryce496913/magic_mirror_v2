@@ -8,10 +8,12 @@ import threading
 import pytest
 
 from magic_mirror.assistant.client import RealtimeClient, RealtimeError
+from magic_mirror.assistant.display import AssistantStateStore
 from magic_mirror.assistant.events import ConversationEvent, ConversationState, EventTracker, FunctionCall
 from magic_mirror.assistant.tools import (Permission, ToolCancelled, ToolDispatcher, ToolRegistry,
                                           ToolSpec, ToolStatus, default_registry)
 from magic_mirror.assistant.voice import VoiceError, VoicePhase
+from magic_mirror.assistant.wake import WakeState
 from magic_mirror.config import ConfigurationError, Settings
 from test_realtime import CREATED, UPDATED, FakeSocket, client_with
 from test_voice import FakePlayback, event, make_voice, pcm_audio, wait_until
@@ -259,6 +261,41 @@ def test_realtime_transport_continuation_and_audio_drain_after_valid_tool(caplog
     with caplog.at_level(logging.INFO):
         asyncio.run(scenario())
     assert "Realtime transport error" not in caplog.text
+
+
+def test_voice_callbacks_keep_tool_and_spoken_response_ids_in_one_dashboard_exchange():
+    async def scenario():
+        store = AssistantStateStore()
+        store.on_state(WakeState.LISTENING)
+        voice, audio, client, _, _ = make_voice(tools_enabled=True)
+        voice.on_event = store.on_event
+        voice.on_playback = store.on_playback
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user"))
+        client.queue.put_nowait(event("conversation.item.input_audio_transcription.completed",
+                                      item="user", role="user", text="Capabilities?", final=True))
+        client.queue.put_nowait(event("response.created", response="tool-response"))
+        client.queue.put_nowait(tool_done("tool-response", tool_call("c1")))
+        await wait_until(lambda: any(item["type"] == "response.create" for item in client.sent))
+        client.queue.put_nowait(event("response.created", response="spoken-response"))
+        client.queue.put_nowait(event("response.output_audio.delta", response="spoken-response",
+                                      item="spoken-item", audio=pcm_audio()))
+        tracker = EventTracker(session_id="sess_test", state=ConversationState.READY)
+        completed = tracker.parse({"type": "response.done", "response": {
+            "id": "spoken-response", "status": "completed", "output": [{
+                "id": "spoken-item", "type": "message", "role": "assistant", "status": "completed",
+                "content": [{"type": "output_audio", "transcript": "I can answer questions."}]}]}}, 1)
+        client.queue.put_nowait(completed)
+        await wait_until(lambda: voice.phase == VoicePhase.LISTENING and audio.playback.starts == 1)
+        assert store.snapshot().user_text == "Capabilities?"
+        assert store.snapshot().assistant_text == "I can answer questions."
+        assert store.snapshot().assistant_final and not store.snapshot().playback
+        voice.stop_event.set()
+        await task
+        assert audio.closed and client.closed
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("status", ["failed", "incomplete"])

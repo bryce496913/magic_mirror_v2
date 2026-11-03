@@ -82,6 +82,25 @@ def test_provider_error_codes_are_symbolic_and_bounded():
     assert private_text not in repr(event) + repr(failed)
 
 
+def test_completed_response_extracts_only_bounded_audio_transcript():
+    tracker = EventTracker(state=ConversationState.READY, session_id="sess_test")
+    completed = tracker.parse({"type": "response.done", "response": {
+        "id": "r1", "status": "completed", "output": [
+            {"type": "function_call", "id": "call-item", "call_id": "call", "name": "safe_tool",
+             "arguments": '{"hidden":"private"}'},
+            {"type": "message", "id": "text-item", "role": "assistant",
+             "content": [{"type": "output_text", "text": "Unspoken model text"}]},
+            {"type": "message", "id": "audio-item", "role": "assistant", "status": "completed",
+             "content": [{"type": "output_audio", "transcript": "Spoken " * 100}]},
+            {"type": "message", "id": "unfinished", "role": "assistant", "status": "incomplete",
+             "content": [{"type": "output_audio", "transcript": "Unfinished"}]},
+        ]}}, 1)
+    assert len(completed.audio_transcripts) == 1
+    assert completed.audio_transcripts[0].item_id == "audio-item"
+    assert completed.audio_transcripts[0].text == ("Spoken " * 100)[:240]
+    assert "private" not in repr(completed.audio_transcripts)
+
+
 def test_connect_ack_settings_and_close():
     async def scenario():
         socket = FakeSocket(CREATED, UPDATED)
