@@ -8,7 +8,7 @@ import threading
 import pytest
 
 from magic_mirror.assistant.client import RealtimeError
-from magic_mirror.assistant.events import ConversationEvent, ConversationState, FunctionCall
+from magic_mirror.assistant.events import ConversationEvent, ConversationState, EventTracker, FunctionCall
 from magic_mirror.assistant.tools import (Permission, ToolCancelled, ToolDispatcher, ToolRegistry,
                                           ToolSpec, ToolStatus, default_registry)
 from magic_mirror.assistant.voice import VoiceError, VoicePhase
@@ -68,6 +68,122 @@ def test_official_function_call_events_and_mock_websocket_continuation():
         assert socket.sent[-1] == {"type": "response.create"}
         await client.close()
     asyncio.run(scenario())
+
+
+def test_raw_realtime_function_sequence_dispatches_and_logs_safe_stages(caplog):
+    async def scenario():
+        voice, audio, client, _, _ = make_voice(tools_enabled=True)
+        tracker = EventTracker(session_id="sess_test", state=ConversationState.READY)
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        raw = [
+            {"type": "input_audio_buffer.speech_started", "item_id": "user"},
+            {"type": "input_audio_buffer.speech_stopped", "item_id": "user"},
+            {"type": "response.created", "response": {"id": "r1"}},
+            {"type": "response.output_item.added", "response_id": "r1", "item": {
+                "id": "i1", "type": "function_call", "call_id": "c1", "name": "get_mirror_capabilities"}},
+            {"type": "response.function_call_arguments.done", "response_id": "r1", "item_id": "i1",
+             "call_id": "c1", "name": "get_mirror_capabilities", "arguments": "{}"},
+            {"type": "response.done", "response": {"id": "r1", "status": "completed", "output": [{
+                "id": "i1", "type": "function_call", "status": "completed", "call_id": "c1",
+                "name": "get_mirror_capabilities", "arguments": "{}"}]}},
+        ]
+        for payload in raw:
+            client.queue.put_nowait(tracker.parse(payload, 1))
+        await wait_until(lambda: any(item["type"] == "response.create" for item in client.sent))
+        assert json.loads(sent_outputs(client)[0]["output"])["status"] == "success"
+        voice.stop_event.set()
+        await task
+        assert audio.closed and client.closed
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(scenario())
+    for stage in ("Function-call requested", "Function-call completion detected",
+                  "validation accepted", "execution started", "execution result (success)",
+                  "Function output submitted", "Response continuation requested"):
+        assert stage in caplog.text
+    assert '"arguments"' not in caplog.text and '"capabilities"' not in caplog.text
+
+
+@pytest.mark.parametrize("status", ["failed", "incomplete"])
+def test_raw_failed_function_response_is_diagnosed_before_dispatch(status, caplog):
+    async def scenario():
+        voice, audio, client, _, _ = make_voice(tools_enabled=True)
+        tracker = EventTracker(session_id="sess_test", state=ConversationState.READY)
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        for payload in (
+            {"type": "input_audio_buffer.speech_started", "item_id": "user"},
+            {"type": "response.created", "response": {"id": "r1"}},
+            {"type": "response.function_call_arguments.done", "response_id": "r1", "item_id": "i1",
+             "call_id": "c1", "name": "get_mirror_capabilities",
+             "arguments": '{"private":"never log this value"}'},
+            {"type": "response.done", "response": {"id": "r1", "status": status,
+             "status_details": {"error": {"code": "server_error"}}, "output": [{
+                 "id": "i1", "type": "function_call", "status": "incomplete", "call_id": "c1",
+                 "name": "get_mirror_capabilities", "arguments": "{}"}]}},
+        ):
+            client.queue.put_nowait(tracker.parse(payload, 1))
+        with pytest.raises(VoiceError, match=status):
+            await task
+        assert audio.closed and client.closed and not sent_outputs(client)
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(scenario())
+    assert f"Realtime response completed (status={status}, function_calls=1)" in caplog.text
+    assert f"Realtime response {status} before tool dispatch" in caplog.text
+    assert "execution started" not in caplog.text
+    assert "never log this value" not in caplog.text
+
+
+def test_continuation_send_failure_closes_voice_after_one_local_execution(caplog):
+    async def scenario():
+        voice, audio, client, _, _ = make_voice(tools_enabled=True)
+        original_send = client.send
+
+        async def reject_continuation(payload):
+            if payload["type"] == "response.create":
+                raise RealtimeError("private transport detail")
+            await original_send(payload)
+
+        client.send = reject_continuation
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user"))
+        client.queue.put_nowait(event("response.created", response="r1"))
+        client.queue.put_nowait(tool_done("r1", tool_call("c1")))
+        with pytest.raises(RealtimeError, match="private transport detail"):
+            await task
+        assert len(sent_outputs(client)) == 1
+        assert audio.closed and client.closed
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(scenario())
+    assert "Function output submitted (status=success)" in caplog.text
+    assert "Response continuation requested" not in caplog.text
+    assert "Realtime transport error" in caplog.text
+    assert "private transport detail" not in caplog.text
+
+
+def test_realtime_error_before_function_dispatch_is_safely_logged(caplog):
+    async def scenario():
+        voice, audio, client, _, _ = make_voice(tools_enabled=True)
+        tracker = EventTracker(session_id="sess_test", state=ConversationState.READY)
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        client.queue.put_nowait(tracker.parse({"type": "input_audio_buffer.speech_started",
+                                               "item_id": "user"}, 1))
+        client.queue.put_nowait(tracker.parse({"type": "response.created", "response": {"id": "r1"}}, 2))
+        client.queue.put_nowait(tracker.parse({"type": "error", "error": {
+            "code": "secret value must not be logged", "message": "provider raw body"}}, 3))
+        with pytest.raises(VoiceError, match="unrecognized_error"):
+            await task
+        assert audio.closed and client.closed and not sent_outputs(client)
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(scenario())
+    assert "Recoverable Realtime error (code=unrecognized_error)" in caplog.text
+    assert "secret value" not in caplog.text and "provider raw body" not in caplog.text
 
 
 def test_registered_tool_keeps_half_duplex_until_spoken_continuation_finishes():

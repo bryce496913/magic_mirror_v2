@@ -70,6 +70,18 @@ def test_input_buffer_clear_ack_is_typed_and_preserves_turn_state():
     assert cleared.state == ConversationState.READY
 
 
+def test_provider_error_codes_are_symbolic_and_bounded():
+    tracker = EventTracker(state=ConversationState.READY, session_id="sess_test")
+    private_text = "private credential marker with spaces"
+    event = tracker.parse({"type": "error", "error": {"code": private_text}}, 1)
+    assert event.error_code == "unrecognized_error"
+    tracker.parse({"type": "response.created", "response": {"id": "r"}}, 2)
+    failed = tracker.parse({"type": "response.done", "response": {
+        "id": "r", "status": "failed", "status_details": {"error": {"code": private_text}}}}, 3)
+    assert failed.error_code == "unrecognized_error"
+    assert private_text not in repr(event) + repr(failed)
+
+
 def test_connect_ack_settings_and_close():
     async def scenario():
         socket = FakeSocket(CREATED, UPDATED)
