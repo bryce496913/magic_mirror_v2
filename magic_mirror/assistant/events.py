@@ -1,6 +1,7 @@
 """Typed, content-free-by-default state tracking for GA Realtime server events."""
 
 import json
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -39,6 +40,13 @@ class FunctionCall:
 
 
 @dataclass(frozen=True)
+class AudioTranscript:
+    item_id: str
+    content_index: int
+    text: str
+
+
+@dataclass(frozen=True)
 class ConversationEvent:
     kind: str
     state: ConversationState
@@ -57,10 +65,18 @@ class ConversationEvent:
     tool_call: FunctionCall | None = None
     tool_calls: tuple[FunctionCall, ...] = ()
     tool_delta: str | None = None
+    audio_transcripts: tuple[AudioTranscript, ...] = ()
 
 
 def _id(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _error_code(value: Any) -> str | None:
+    """Only symbolic provider codes may reach diagnostics or CLI errors."""
+    if value is None:
+        return None
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value) else "unrecognized_error"
 
 
 @dataclass
@@ -96,6 +112,7 @@ class EventTracker:
         tool_call = None
         tool_calls = ()
         tool_delta = None
+        audio_transcripts = ()
 
         def function_call(source: dict[str, Any]) -> FunctionCall:
             return FunctionCall(_id(source.get("call_id")) or "", _id(source.get("id")) or "",
@@ -140,17 +157,31 @@ class EventTracker:
                     self.usage[key] += value
             details = response.get("status_details")
             if isinstance(details, dict) and isinstance(details.get("error"), dict):
-                code = _id(details["error"].get("code")) or _id(details["error"].get("type"))
+                code = _error_code(details["error"].get("code") or details["error"].get("type"))
             output = response.get("output", [])
             if isinstance(output, list):
                 tool_calls = tuple(function_call(value) for value in output
                                    if isinstance(value, dict) and value.get("type") == "function_call")
+                if status == "completed":
+                    completed_audio = []
+                    for value in output[:8]:
+                        if (not isinstance(value, dict) or value.get("type") != "message" or
+                                value.get("role") != "assistant" or
+                                value.get("status") not in (None, "completed") or
+                                not _id(value.get("id")) or not isinstance(value.get("content"), list)):
+                            continue
+                        for index, part in enumerate(value["content"][:8]):
+                            if (isinstance(part, dict) and part.get("type") == "output_audio" and
+                                    isinstance(part.get("transcript"), str) and part["transcript"]):
+                                completed_audio.append(AudioTranscript(value["id"], index,
+                                                                         part["transcript"][:240]))
+                    audio_transcripts = tuple(completed_audio[:8])
             self.state = ConversationState.RESPONDING if self.response_started else (ConversationState.ERROR if status == "failed" else ConversationState.READY)
         elif kind == "error":
             error = payload.get("error")
             if not isinstance(error, dict):
                 return ConversationEvent("invalid", self.state, self.session_id, event_id=event_id)
-            code = _id(error.get("code")) or _id(error.get("type"))
+            code = _error_code(error.get("code") or error.get("type"))
             status = "error"
             # Server errors are often recoverable; the caller decides whether to close.
         elif kind in {"conversation.item.input_audio_transcription.delta",
@@ -209,4 +240,4 @@ class EventTracker:
 
         return ConversationEvent(kind, self.state, self.session_id, response_id, item_id,
                                  event_id, role, text, audio, final, status, usage, code,
-                                 content_index, tool_call, tool_calls, tool_delta)
+                                 content_index, tool_call, tool_calls, tool_delta, audio_transcripts)

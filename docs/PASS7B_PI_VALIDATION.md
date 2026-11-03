@@ -1,6 +1,6 @@
 # Pass 7B Raspberry Pi validation
 
-Use the existing Raspberry Pi installation and private `.env`. Preserve `.venv`, the local wake model, Pi-hole password/CA files, PipeWire settings, LED wiring, and dashboard configuration. This PR depends on the Pass 7A tool foundation; do not install it onto the hardware until the project lead has accepted that dependency. Stop the existing mirror and wake processes cleanly before switching branches.
+Use the existing Raspberry Pi installation and private `.env`. Preserve `.venv`, the local wake model, Pi-hole password/CA files, PipeWire settings, LED wiring, and dashboard configuration. Pass 7A is merged into `main`; this branch includes its Realtime, transcript, and watchdog fixes. Stop the existing mirror and wake processes cleanly before switching branches.
 
 ```bash
 cd ~/magic_mirror_v2
@@ -14,6 +14,8 @@ test -x .venv/bin/python || python3 -m venv .venv
 ```
 
 Edit the existing ignored `.env` locally: keep the previously verified `OPENAI_API_KEY`, `MIRROR_AUDIO_INPUT_DEVICE=pipewire`, physical source check, `MIRROR_AUDIO_OUTPUT_DEVICE=MAX98357A`, 48 kHz mono int16, local gain, wake model path, Pi-hole CA/password paths, and LED BCM22/27/24 mapping. Set `MIRROR_HOST=127.0.0.1`, `MIRROR_TOOLS_ENABLED=true`, both `MIRROR_WEATHER_LATITUDE` and `MIRROR_WEATHER_LONGITUDE` to your own location, and optionally `MIRROR_WEATHER_LOCATION_NAME` to a spoken label. Set `MIRROR_WEATHER_UNIT=celsius` or `fahrenheit` for voice output. Defaults for `MIRROR_TOOL_TIMEOUT_SECONDS=15`, `MIRROR_TOOL_MAX_OUTPUT_BYTES=2048`, and `MIRROR_VOICE_WEATHER_CACHE_SECONDS=600` are suitable initially. Do not display or attach `.env` in reports.
+
+The weather HTTP client bounds each request to five seconds and the tool dispatcher bounds the whole weather operation, including optional city geocoding, to 15 seconds by default. A timeout becomes a status-only tool result and the assistant requests one continuation. The Pass 7A Realtime idle deadline is 60 seconds by default, so the tool has time to finish or time out before the idle watchdog expires; its response deadline tracks active server responses. Keep the configured Realtime idle limit comfortably above the tool timeout if changing either value. The Pass 7A receive-deadline and Python 3.11 watchdog fixes remain active while weather runs.
 
 Start the dashboard in one terminal with `./scripts/run_pi.sh`, then verify `curl --fail --silent http://127.0.0.1:5000/health`. Start the wake listener in another terminal with `.venv/bin/python -m magic_mirror.assistant.wake_cli --start`. While the listener is idle, verify no OpenAI connection or weather request is created by that process, for example with `ss -tnp` and the wake process ID. The dashboard's independent weather refresh may still contact Open-Meteo; distinguish its PID from the wake listener. The idle LED should be white.
 

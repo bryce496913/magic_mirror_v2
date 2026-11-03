@@ -4,6 +4,8 @@ import asyncio
 import json
 
 import pytest
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
+from websockets.frames import Close
 
 from magic_mirror.assistant.client import RealtimeClient, RealtimeError
 from magic_mirror.assistant.events import ConversationState, EventTracker
@@ -68,6 +70,37 @@ def test_input_buffer_clear_ack_is_typed_and_preserves_turn_state():
     assert cleared.kind == "input_audio_buffer.cleared"
     assert cleared.session_id == "sess_test" and cleared.event_id == "clear-1"
     assert cleared.state == ConversationState.READY
+
+
+def test_provider_error_codes_are_symbolic_and_bounded():
+    tracker = EventTracker(state=ConversationState.READY, session_id="sess_test")
+    private_text = "private credential marker with spaces"
+    event = tracker.parse({"type": "error", "error": {"code": private_text}}, 1)
+    assert event.error_code == "unrecognized_error"
+    tracker.parse({"type": "response.created", "response": {"id": "r"}}, 2)
+    failed = tracker.parse({"type": "response.done", "response": {
+        "id": "r", "status": "failed", "status_details": {"error": {"code": private_text}}}}, 3)
+    assert failed.error_code == "unrecognized_error"
+    assert private_text not in repr(event) + repr(failed)
+
+
+def test_completed_response_extracts_only_bounded_audio_transcript():
+    tracker = EventTracker(state=ConversationState.READY, session_id="sess_test")
+    completed = tracker.parse({"type": "response.done", "response": {
+        "id": "r1", "status": "completed", "output": [
+            {"type": "function_call", "id": "call-item", "call_id": "call", "name": "safe_tool",
+             "arguments": '{"hidden":"private"}'},
+            {"type": "message", "id": "text-item", "role": "assistant",
+             "content": [{"type": "output_text", "text": "Unspoken model text"}]},
+            {"type": "message", "id": "audio-item", "role": "assistant", "status": "completed",
+             "content": [{"type": "output_audio", "transcript": "Spoken " * 100}]},
+            {"type": "message", "id": "unfinished", "role": "assistant", "status": "incomplete",
+             "content": [{"type": "output_audio", "transcript": "Unfinished"}]},
+        ]}}, 1)
+    assert len(completed.audio_transcripts) == 1
+    assert completed.audio_transcripts[0].item_id == "audio-item"
+    assert completed.audio_transcripts[0].text == ("Spoken " * 100)[:240]
+    assert "private" not in repr(completed.audio_transcripts)
 
 
 def test_connect_ack_settings_and_close():
@@ -278,6 +311,29 @@ def test_idle_watchdog_closes_without_receive():
     run(scenario())
 
 
+def test_watchdog_cancellation_after_immediate_send_does_not_hang_close():
+    async def scenario():
+        socket = FakeSocket(CREATED, UPDATED)
+        client, _ = client_with(socket)
+        await client.connect()
+        await client.send({"type": "response.create"})
+        # Keep the close in its own task so the test can detect a cancellation
+        # deadlock without waiting for the normal 60-second idle deadline.
+        closing = asyncio.create_task(client.close())
+        done, _ = await asyncio.wait({closing}, timeout=1)
+        finished_promptly = closing in done
+        if not finished_promptly:
+            # Release a stranded Event.wait child before failing the test, so
+            # asyncio.run does not inherit the same deadlock on cleanup.
+            client._activity.set()
+            await asyncio.wait({closing}, timeout=1)
+        assert finished_promptly, "watchdog cancellation blocked Realtime close"
+        await closing
+        assert socket.closed and client._watchdog is None
+
+    run(scenario())
+
+
 def test_shutdown_while_receive_is_waiting():
     class WaitingSocket(FakeSocket):
         def __init__(self):
@@ -301,9 +357,91 @@ def test_shutdown_while_receive_is_waiting():
         waiting = asyncio.create_task(client.receive())
         await asyncio.sleep(0)
         await client.close()
-        with pytest.raises(RealtimeError, match="closed unexpectedly"):
+        with pytest.raises(RealtimeError, match="session is disconnected") as caught:
             await waiting
+        assert caught.value.category == "local_shutdown"
         assert socket.closed
+    run(scenario())
+
+
+def test_pending_receive_uses_extended_deadline_after_tool_continuation():
+    class ContinuationSocket(FakeSocket):
+        def __init__(self):
+            super().__init__(CREATED, UPDATED)
+            self.waiting = asyncio.Event()
+            self.release = asyncio.Event()
+            self.attempts = 0
+
+        async def recv(self):
+            if self.events:
+                return await super().recv()
+            self.attempts += 1
+            if self.attempts == 1:
+                self.waiting.set()
+                await self.release.wait()
+                raise TimeoutError()  # the receive began before response.create
+            return json.dumps({"type": "response.created", "response": {"id": "continuation"}})
+
+    async def scenario():
+        now = [0.0]
+        socket = ContinuationSocket()
+        client, _ = client_with(socket, realtime_idle_seconds=1)
+        client.clock = lambda: now[0]
+        await client.connect()
+        pending = asyncio.create_task(client.receive())
+        await socket.waiting.wait()
+        now[0] = 0.8
+        await client.send({"type": "conversation.item.create", "item": {
+            "type": "function_call_output", "call_id": "call", "output": '{"status":"success"}'}})
+        await client.send({"type": "response.create"})
+        now[0] = 1.1  # old receive deadline expired; new deadline has not
+        socket.release.set()
+        event = await asyncio.wait_for(pending, 1)
+        assert event.kind == "response.created" and event.response_id == "continuation"
+        assert socket.attempts == 2 and not socket.closed
+        await client.close()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("closed,category,code", [
+    (ConnectionClosedOK(Close(1000, "private-reason"), Close(1000, "private-reason"), True),
+     "remote_clean", 1000),
+    (ConnectionClosedError(Close(1011, "private-reason"), Close(1011, "private-reason"), True),
+     "remote_error", 1011),
+    (ConnectionClosedError(None, None), "abnormal_no_frame", None),
+])
+def test_close_diagnostics_are_bounded_and_do_not_include_provider_reason(closed, category, code):
+    async def scenario():
+        socket = FakeSocket(CREATED, UPDATED, closed)
+        client, _ = client_with(socket)
+        await client.connect()
+        with pytest.raises(RealtimeError, match="closed unexpectedly") as caught:
+            await client.receive()
+        assert caught.value.category == category
+        assert caught.value.close_code == code
+        assert "private-reason" not in str(caught.value) + repr(caught.value.__dict__)
+        assert socket.closed
+
+    run(scenario())
+
+
+def test_local_receive_timeout_is_distinct_from_remote_close():
+    async def scenario():
+        now = [0.0]
+        socket = FakeSocket(CREATED, UPDATED)
+        client, _ = client_with(socket, realtime_idle_seconds=1)
+        client.clock = lambda: now[0]
+        await client.connect()
+        await client.send({"type": "response.create"})
+        assert socket.sent[-1] == {"type": "response.create"}
+        now[0] = 1.0
+        with pytest.raises(RealtimeError, match="idle timeout") as caught:
+            await client.receive()
+        assert caught.value.category == "local_timeout"
+        assert caught.value.close_code is None
+        assert socket.closed
+
     run(scenario())
 
 
