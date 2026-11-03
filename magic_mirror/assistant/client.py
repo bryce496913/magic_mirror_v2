@@ -171,7 +171,12 @@ class RealtimeClient:
                 await self.close()
                 return
             try:
-                await asyncio.wait_for(self._activity.wait(), remaining)
+                # asyncio.wait_for(Event.wait()) creates a child task. On
+                # Python 3.11, cancelling this watchdog while that child is
+                # pending can leave close() awaiting the watchdog forever.
+                # asyncio.timeout() bounds the wait on this task directly.
+                async with asyncio.timeout(remaining):
+                    await self._activity.wait()
             except TimeoutError:
                 if self.socket is not None and self.clock() < self._deadline()[0]:
                     continue

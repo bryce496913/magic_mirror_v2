@@ -81,6 +81,17 @@ The expected successful path is `Function-call requested` → `Function-call com
 
 ## Continuation closure retest
 
+The Pi's Python 3.11 test run on `3a96034` stalled at `test_official_function_call_events_and_mock_websocket_continuation`. This was reproduced in a clean Python 3.11 environment without hardware or network access. The fake socket delivered all events and sent the continuation; cleanup hung while `close()` awaited the cancelled watchdog. On Python 3.11, cancelling its nested `asyncio.wait_for(Event.wait())` could leave the child wait task pending. The watchdog now uses `asyncio.timeout()` on its own task. The protocol fixture remains intact, but its waits are bounded and it closes the client in `finally`. An immediate-send shutdown regression covers the cancellation race. No production timeout limits were loosened.
+
+After pulling the new PR head, run the previously stalled group and then the complete suite. Both commands must exit normally; do not continue to paid API validation if either times out:
+
+```bash
+cd ~/magic_mirror_v2
+git rev-parse --short HEAD
+timeout --signal=INT --kill-after=10s 60s .venv/bin/python -m pytest -q tests/test_realtime.py tests/test_tool_calls.py tests/test_assistant_display.py
+timeout --signal=INT --kill-after=10s 120s .venv/bin/python -m pytest -q
+```
+
 On commit `29223c6`, one Pi run completed local tool execution and sent `response.create`, then logged `connection_closed` about 16 seconds later without a continuation `response.done`. Another run had completed the continuation. The exact Pi-side cause is unconfirmed. The client had a reproducible local timing defect: a receive already waiting before the tool output kept its old idle deadline after the output and continuation extended activity. That timeout can now resume its wait using the updated deadline. The watchdog also rechecks activity before closing. The new transport log distinguishes `local_timeout`, `local_shutdown`, `remote_clean`, `remote_error`, `abnormal_no_frame`, and `socket_error`; it prints a numeric close code when a close frame provides one, never the provider's close reason.
 
 After updating to the new PR head with the installation commands above, confirm the short commit ID changed. With both foreground processes running and Chromium on the Pi's `http://127.0.0.1:5000/`, ask the capabilities question once, listen for the complete answer, and confirm the answer appears on the dashboard. If it fails, record the elapsed time from `Response continuation requested` to the next log line, the sanitized `reason`, `close_category`, and `close_code`, whether `Response continuation started` appeared, and whether the LED returned to white idle. A `local_timeout` points to an application deadline; a `remote_*` category means a close frame was received, but its cause still requires evidence. `abnormal_no_frame` means no close frame was received. An absent `Response continuation started` means the client did not observe a server `response.created` event, even though it submitted the request. None of these categories alone attributes fault to OpenAI or the network.

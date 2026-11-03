@@ -311,6 +311,29 @@ def test_idle_watchdog_closes_without_receive():
     run(scenario())
 
 
+def test_watchdog_cancellation_after_immediate_send_does_not_hang_close():
+    async def scenario():
+        socket = FakeSocket(CREATED, UPDATED)
+        client, _ = client_with(socket)
+        await client.connect()
+        await client.send({"type": "response.create"})
+        # Keep the close in its own task so the test can detect a cancellation
+        # deadlock without waiting for the normal 60-second idle deadline.
+        closing = asyncio.create_task(client.close())
+        done, _ = await asyncio.wait({closing}, timeout=1)
+        finished_promptly = closing in done
+        if not finished_promptly:
+            # Release a stranded Event.wait child before failing the test, so
+            # asyncio.run does not inherit the same deadlock on cleanup.
+            client._activity.set()
+            await asyncio.wait({closing}, timeout=1)
+        assert finished_promptly, "watchdog cancellation blocked Realtime close"
+        await closing
+        assert socket.closed and client._watchdog is None
+
+    run(scenario())
+
+
 def test_shutdown_while_receive_is_waiting():
     class WaitingSocket(FakeSocket):
         def __init__(self):

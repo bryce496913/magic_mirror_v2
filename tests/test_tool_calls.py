@@ -59,19 +59,22 @@ def test_official_function_call_events_and_mock_websocket_continuation():
     async def scenario():
         socket = FakeSocket(CREATED, UPDATED, delta, done, response)
         client, _ = client_with(socket)
-        await client.connect()
-        partial, final, completed = await client.receive(), await client.receive(), await client.receive()
-        assert partial.tool_call.call_id == final.tool_call.call_id == "c1"
-        assert partial.tool_delta == "{" and final.tool_call.arguments == "{}"
-        assert completed.tool_calls == (tool_call("c1", item_id="i1"),)
-        assert client.tracker.parse(response, 1).kind == "duplicate"
-        await client.send({"type": "conversation.item.create", "item": {
-            "type": "function_call_output", "call_id": "c1", "output": '{"status":"success"}'}})
-        await client.send({"type": "response.create"})
-        assert socket.sent[-2]["item"]["call_id"] == "c1"
-        assert socket.sent[-1] == {"type": "response.create"}
-        await client.close()
-    asyncio.run(scenario())
+        try:
+            await client.connect()
+            partial, final, completed = await client.receive(), await client.receive(), await client.receive()
+            assert partial.tool_call.call_id == final.tool_call.call_id == "c1"
+            assert partial.tool_delta == "{" and final.tool_call.arguments == "{}"
+            assert completed.tool_calls == (tool_call("c1", item_id="i1"),)
+            assert client.tracker.parse(response, 1).kind == "duplicate"
+            await client.send({"type": "conversation.item.create", "item": {
+                "type": "function_call_output", "call_id": "c1", "output": '{"status":"success"}'}})
+            await client.send({"type": "response.create"})
+            assert socket.sent[-2]["item"]["call_id"] == "c1"
+            assert socket.sent[-1] == {"type": "response.create"}
+        finally:
+            await client.close()
+        assert socket.closed and client._watchdog is None
+    asyncio.run(asyncio.wait_for(scenario(), 5))
 
 
 def test_raw_realtime_function_sequence_dispatches_and_logs_safe_stages(caplog):
