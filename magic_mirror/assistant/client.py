@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import quote
 
 from websockets.asyncio.client import connect as websocket_connect
-from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
+from websockets.exceptions import ConnectionClosed, ConnectionClosedOK, InvalidStatus, WebSocketException
 
 from ..config import Settings
 from .events import ConversationEvent, ConversationState, EventTracker
@@ -16,6 +16,21 @@ from .events import ConversationEvent, ConversationState, EventTracker
 
 class RealtimeError(RuntimeError):
     """A safe-to-display Realtime transport or protocol error."""
+
+    def __init__(self, message: str, *, category: str | None = None,
+                 close_code: int | None = None):
+        super().__init__(message)
+        self.category = category
+        self.close_code = close_code
+
+
+def _close_diagnostics(exc: ConnectionClosed) -> tuple[str, int | None]:
+    """Use only the close-frame category and numeric code, never its reason text."""
+    frame = exc.rcvd
+    if frame is None:
+        return "abnormal_no_frame", None
+    code = frame.code if isinstance(frame.code, int) and 1000 <= frame.code <= 4999 else None
+    return ("remote_clean" if isinstance(exc, ConnectionClosedOK) else "remote_error"), code
 
 
 class RealtimeClient:
@@ -114,9 +129,20 @@ class RealtimeClient:
                 if socket is None:
                     raise RealtimeError("Realtime session is disconnected")
                 await asyncio.wait_for(socket.send(json.dumps(payload)), self.settings.realtime_connect_timeout)
-        except (TimeoutError, ConnectionClosed, OSError):
+        except TimeoutError:
             await self.close()
-            raise RealtimeError("Realtime send failed") from None
+            raise RealtimeError("Realtime send failed", category="local_timeout") from None
+        except ConnectionClosed as exc:
+            category, code = _close_diagnostics(exc)
+            if self.socket is None:
+                category = "local_timeout" if self._expiry_reason else "local_shutdown"
+                code = None
+            await self.close()
+            raise RealtimeError("Realtime send failed", category=category, close_code=code) from None
+        except OSError:
+            category = ("local_timeout" if self._expiry_reason else "local_shutdown") if self.socket is None else "socket_error"
+            await self.close()
+            raise RealtimeError("Realtime send failed", category=category) from None
         except WebSocketException:
             await self.close()
             raise RealtimeError("Realtime WebSocket protocol error") from None
@@ -133,16 +159,22 @@ class RealtimeClient:
 
     async def _watch_limits(self) -> None:
         while self.socket is not None and self.started_at is not None:
+            # Clear before reading the deadline so activity during this window
+            # cannot be lost and mistaken for an expired idle period.
+            self._activity.clear()
             deadline, reason = self._deadline()
             remaining = deadline - self.clock()
             if remaining <= 0:
+                if self.clock() < self._deadline()[0]:
+                    continue
                 self._expiry_reason = reason
                 await self.close()
                 return
-            self._activity.clear()
             try:
                 await asyncio.wait_for(self._activity.wait(), remaining)
             except TimeoutError:
+                if self.socket is not None and self.clock() < self._deadline()[0]:
+                    continue
                 self._expiry_reason = reason
                 await self.close()
                 return
@@ -151,8 +183,9 @@ class RealtimeClient:
         if self.socket is not None and self.started_at is not None:
             deadline, reason = self._deadline()
             if self.clock() >= deadline:
+                self._expiry_reason = reason
                 await self.close()
-                raise RealtimeError(reason)
+                raise RealtimeError(reason, category="local_timeout")
         if self.state not in {ConversationState.READY, ConversationState.LISTENING,
                               ConversationState.PROCESSING, ConversationState.RESPONDING}:
             raise RealtimeError("Realtime session is not ready")
@@ -168,25 +201,56 @@ class RealtimeClient:
 
     async def receive(self) -> ConversationEvent:
         if self.socket is None or self.started_at is None or self.last_activity is None:
-            raise RealtimeError(self._expiry_reason or "Realtime session is disconnected")
-        now = self.clock()
-        deadline, reason = self._deadline()
-        if now >= deadline:
-            await self.close()
-            raise RealtimeError(reason)
-        try:
-            raw = await asyncio.wait_for(self.socket.recv(), deadline - now)
-        except TimeoutError:
-            await self.close()
-            raise RealtimeError(reason) from None
-        except (ConnectionClosed, OSError):
-            await self.close()
-            self.tracker.state = ConversationState.ERROR
-            raise RealtimeError(self._expiry_reason or "Realtime connection closed unexpectedly") from None
-        except WebSocketException:
-            await self.close()
-            self.tracker.state = ConversationState.ERROR
-            raise RealtimeError("Realtime WebSocket protocol error") from None
+            raise RealtimeError(self._expiry_reason or "Realtime session is disconnected",
+                                category="local_timeout" if self._expiry_reason else "local_shutdown")
+        while True:
+            now = self.clock()
+            deadline, reason = self._deadline()
+            if now >= deadline:
+                self._expiry_reason = reason
+                await self.close()
+                raise RealtimeError(reason, category="local_timeout")
+            socket = self.socket
+            if socket is None:
+                raise RealtimeError(self._expiry_reason or "Realtime session is disconnected",
+                                    category="local_timeout" if self._expiry_reason else "local_shutdown")
+            try:
+                raw = await asyncio.wait_for(socket.recv(), deadline - now)
+                break
+            except TimeoutError:
+                # A tool output or response.create may have extended activity
+                # after this receive began. Recalculate rather than close on
+                # the stale deadline.
+                if self.socket is socket and self.clock() < self._deadline()[0]:
+                    await asyncio.sleep(0)
+                    continue
+                if self.socket is not socket:
+                    raise RealtimeError(self._expiry_reason or "Realtime session is disconnected",
+                                        category="local_timeout" if self._expiry_reason else "local_shutdown") from None
+                self._expiry_reason = reason
+                await self.close()
+                raise RealtimeError(reason, category="local_timeout") from None
+            except ConnectionClosed as exc:
+                category, code = _close_diagnostics(exc)
+                if self.socket is None:
+                    category = "local_timeout" if self._expiry_reason else "local_shutdown"
+                    code = None
+                message = ("Realtime session is disconnected" if category == "local_shutdown" else
+                           self._expiry_reason or "Realtime connection closed unexpectedly")
+                await self.close()
+                self.tracker.state = ConversationState.ERROR
+                raise RealtimeError(message, category=category, close_code=code) from None
+            except OSError:
+                category = ("local_timeout" if self._expiry_reason else "local_shutdown") if self.socket is None else "socket_error"
+                message = ("Realtime session is disconnected" if category == "local_shutdown" else
+                           self._expiry_reason or "Realtime connection closed unexpectedly")
+                await self.close()
+                self.tracker.state = ConversationState.ERROR
+                raise RealtimeError(message, category=category) from None
+            except WebSocketException:
+                await self.close()
+                self.tracker.state = ConversationState.ERROR
+                raise RealtimeError("Realtime WebSocket protocol error", category="protocol_error") from None
         self.last_activity = self.clock()
         event = self.tracker.parse(raw, self.last_activity)
         self._activity.set()

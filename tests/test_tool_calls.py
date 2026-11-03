@@ -6,6 +6,8 @@ import logging
 import threading
 
 import pytest
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
 
 from magic_mirror.assistant.client import RealtimeClient, RealtimeError
 from magic_mirror.assistant.display import AssistantStateStore
@@ -261,6 +263,65 @@ def test_realtime_transport_continuation_and_audio_drain_after_valid_tool(caplog
     with caplog.at_level(logging.INFO):
         asyncio.run(scenario())
     assert "Realtime transport error" not in caplog.text
+
+
+def test_remote_close_after_tool_continuation_releases_audio_and_logs_only_safe_details(caplog):
+    async def scenario():
+        class Socket:
+            def __init__(self):
+                self.incoming = asyncio.Queue()
+                self.sent = []
+                self.closed = False
+                for payload in (CREATED, UPDATED, UPDATED):
+                    self.incoming.put_nowait(payload)
+
+            async def recv(self):
+                value = await self.incoming.get()
+                if isinstance(value, Exception):
+                    raise value
+                return json.dumps(value)
+
+            async def send(self, message):
+                payload = json.loads(message)
+                self.sent.append(payload)
+                if payload["type"] == "response.create":
+                    # No response.created or response.done follows the continuation.
+                    self.incoming.put_nowait(ConnectionClosedError(
+                        Close(1011, "private-provider-reason"),
+                        Close(1011, "private-provider-reason"), True))
+
+            async def close(self):
+                self.closed = True
+
+        socket = Socket()
+
+        async def connector(_url, **_kwargs):
+            return socket
+
+        voice, audio, _, _, _ = make_voice(tools_enabled=True,
+                                          openai_api_key="fixture-only-key")
+        voice.client = RealtimeClient(voice.settings, connector=connector)
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        for incoming in (
+            {"type": "input_audio_buffer.speech_started", "item_id": "user"},
+            {"type": "input_audio_buffer.speech_stopped", "item_id": "user"},
+            {"type": "response.created", "response": {"id": "r1"}},
+            {"type": "response.done", "response": {"id": "r1", "status": "completed", "output": [{
+                "id": "i1", "type": "function_call", "status": "completed", "call_id": "c1",
+                "name": "get_mirror_capabilities", "arguments": "{}"}]}},
+        ):
+            socket.incoming.put_nowait(incoming)
+        with pytest.raises(RealtimeError, match="closed unexpectedly") as caught:
+            await asyncio.wait_for(task, 2)
+        assert caught.value.category == "remote_error" and caught.value.close_code == 1011
+        assert socket.closed and audio.closed and not audio.capture.active
+        assert sum(payload["type"] == "response.create" for payload in socket.sent) == 1
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(scenario())
+    assert "close_category=remote_error close_code=1011" in caplog.text
+    assert "private-provider-reason" not in caplog.text
 
 
 def test_voice_callbacks_keep_tool_and_spoken_response_ids_in_one_dashboard_exchange():

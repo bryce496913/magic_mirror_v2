@@ -79,6 +79,29 @@ Wake once and ask the same capabilities question. Read only these diagnostic lin
 
 The expected successful path is `Function-call requested` → `Function-call completion detected` → `validation accepted` → `execution started` → `execution result (success)` → `Function output submitted (status=success)` → `Response continuation requested` → a completed response with zero function calls → audible reply → green listening after playback drain. If the stage stops after output submission, continuation send failed. If it stops after continuation requested, record the next sanitized response status or transport reason and the elapsed time. Share only the stage lines, their order, sanitized codes, and whether the LED returned to white idle. The diagnostics deliberately omit call IDs, arguments, function output, raw audio, transcripts, headers, keys and full provider payloads. Press `e` then Enter to sleep, `q` then Enter or Ctrl+C to stop, and verify the microphone, speaker and GPIO are released. Do not repeatedly make paid calls solely to obtain a trace.
 
+## Continuation closure retest
+
+On commit `29223c6`, one Pi run completed local tool execution and sent `response.create`, then logged `connection_closed` about 16 seconds later without a continuation `response.done`. Another run had completed the continuation. The exact Pi-side cause is unconfirmed. The client had a reproducible local timing defect: a receive already waiting before the tool output kept its old idle deadline after the output and continuation extended activity. That timeout can now resume its wait using the updated deadline. The watchdog also rechecks activity before closing. The new transport log distinguishes `local_timeout`, `local_shutdown`, `remote_clean`, `remote_error`, `abnormal_no_frame`, and `socket_error`; it prints a numeric close code when a close frame provides one, never the provider's close reason.
+
+After updating to the new PR head with the installation commands above, confirm the short commit ID changed. With both foreground processes running and Chromium on the Pi's `http://127.0.0.1:5000/`, ask the capabilities question once, listen for the complete answer, and confirm the answer appears on the dashboard. If it fails, record the elapsed time from `Response continuation requested` to the next log line, the sanitized `reason`, `close_category`, and `close_code`, whether `response.created` appeared for the continuation, and whether the LED returned to white idle. A `local_timeout` points to an application deadline; a `remote_*` category means a close frame was received, but its cause still requires evidence. `abnormal_no_frame` means no close frame was received. An absent continuation `response.created` means the client did not observe the server starting it, even though it submitted the request. None of these categories alone attributes fault to OpenAI or the network.
+
+To report the active watchdog limits without showing `.env` or credentials, use:
+
+```bash
+cd ~/magic_mirror_v2
+.venv/bin/python - <<'PY'
+from dotenv import load_dotenv
+from magic_mirror.config import Settings
+load_dotenv('.env', override=False)
+s = Settings.from_env()
+print('idle_seconds:', s.realtime_idle_seconds,
+      'response_seconds:', s.realtime_max_response_seconds,
+      'session_seconds:', s.realtime_max_session_seconds)
+PY
+```
+
+Stop the wake CLI with Ctrl+C after the single test and confirm the LED is off and no audio stream remains. Restart it once to check recovery without rebooting. Keep `.env`, `.private/`, wake model files, Pi-hole configuration, and the existing `.venv` in place.
+
 ## Dashboard transcript retest
 
 The subsequent Pi run confirmed a successful capabilities call, function output, spoken continuation, audible answer, and LED transition, but the dashboard showed **Assistant unavailable**. That label means the browser could not obtain a usable `/api/assistant` snapshot; it does not establish that the Realtime transcript was missing. Two code gaps were reproduced with hardware-free tests and fixed here: a completed audio transcript present only in `response.done` was discarded by the parser, and a fully bounded Unicode exchange could exceed the state socket's old 2 KiB read limit. The socket now permits at most 8 KiB and still rejects oversized snapshots. The exact Pi-side read failure remains to be identified at hardware retest.

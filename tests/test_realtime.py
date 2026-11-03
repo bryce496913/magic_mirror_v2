@@ -4,6 +4,8 @@ import asyncio
 import json
 
 import pytest
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
+from websockets.frames import Close
 
 from magic_mirror.assistant.client import RealtimeClient, RealtimeError
 from magic_mirror.assistant.events import ConversationState, EventTracker
@@ -332,9 +334,91 @@ def test_shutdown_while_receive_is_waiting():
         waiting = asyncio.create_task(client.receive())
         await asyncio.sleep(0)
         await client.close()
-        with pytest.raises(RealtimeError, match="closed unexpectedly"):
+        with pytest.raises(RealtimeError, match="session is disconnected") as caught:
             await waiting
+        assert caught.value.category == "local_shutdown"
         assert socket.closed
+    run(scenario())
+
+
+def test_pending_receive_uses_extended_deadline_after_tool_continuation():
+    class ContinuationSocket(FakeSocket):
+        def __init__(self):
+            super().__init__(CREATED, UPDATED)
+            self.waiting = asyncio.Event()
+            self.release = asyncio.Event()
+            self.attempts = 0
+
+        async def recv(self):
+            if self.events:
+                return await super().recv()
+            self.attempts += 1
+            if self.attempts == 1:
+                self.waiting.set()
+                await self.release.wait()
+                raise TimeoutError()  # the receive began before response.create
+            return json.dumps({"type": "response.created", "response": {"id": "continuation"}})
+
+    async def scenario():
+        now = [0.0]
+        socket = ContinuationSocket()
+        client, _ = client_with(socket, realtime_idle_seconds=1)
+        client.clock = lambda: now[0]
+        await client.connect()
+        pending = asyncio.create_task(client.receive())
+        await socket.waiting.wait()
+        now[0] = 0.8
+        await client.send({"type": "conversation.item.create", "item": {
+            "type": "function_call_output", "call_id": "call", "output": '{"status":"success"}'}})
+        await client.send({"type": "response.create"})
+        now[0] = 1.1  # old receive deadline expired; new deadline has not
+        socket.release.set()
+        event = await asyncio.wait_for(pending, 1)
+        assert event.kind == "response.created" and event.response_id == "continuation"
+        assert socket.attempts == 2 and not socket.closed
+        await client.close()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("closed,category,code", [
+    (ConnectionClosedOK(Close(1000, "private-reason"), Close(1000, "private-reason"), True),
+     "remote_clean", 1000),
+    (ConnectionClosedError(Close(1011, "private-reason"), Close(1011, "private-reason"), True),
+     "remote_error", 1011),
+    (ConnectionClosedError(None, None), "abnormal_no_frame", None),
+])
+def test_close_diagnostics_are_bounded_and_do_not_include_provider_reason(closed, category, code):
+    async def scenario():
+        socket = FakeSocket(CREATED, UPDATED, closed)
+        client, _ = client_with(socket)
+        await client.connect()
+        with pytest.raises(RealtimeError, match="closed unexpectedly") as caught:
+            await client.receive()
+        assert caught.value.category == category
+        assert caught.value.close_code == code
+        assert "private-reason" not in str(caught.value) + repr(caught.value.__dict__)
+        assert socket.closed
+
+    run(scenario())
+
+
+def test_local_receive_timeout_is_distinct_from_remote_close():
+    async def scenario():
+        now = [0.0]
+        socket = FakeSocket(CREATED, UPDATED)
+        client, _ = client_with(socket, realtime_idle_seconds=1)
+        client.clock = lambda: now[0]
+        await client.connect()
+        await client.send({"type": "response.create"})
+        assert socket.sent[-1] == {"type": "response.create"}
+        now[0] = 1.0
+        with pytest.raises(RealtimeError, match="idle timeout") as caught:
+            await client.receive()
+        assert caught.value.category == "local_timeout"
+        assert caught.value.close_code is None
+        assert socket.closed
+
     run(scenario())
 
 

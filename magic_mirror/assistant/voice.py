@@ -212,8 +212,15 @@ class VoiceConversation:
                 stopper.cancel()
                 tool_error.cancel()
         except RealtimeError as exc:
-            LOGGER.warning("Realtime transport error (reason=%s); voice session recovering",
-                           TRANSPORT_REASONS.get(str(exc), "unknown"))
+            if not (self.stop_event.is_set() and exc.category == "local_shutdown"):
+                category = exc.category if exc.category in {
+                    "remote_clean", "remote_error", "abnormal_no_frame", "socket_error",
+                    "protocol_error", "local_timeout", "local_shutdown",
+                } else "unknown"
+                code = (exc.close_code if isinstance(exc.close_code, int) and
+                        1000 <= exc.close_code <= 4999 else "none")
+                LOGGER.warning("Realtime transport error (reason=%s); close_category=%s close_code=%s; voice session recovering",
+                               TRANSPORT_REASONS.get(str(exc), "unknown"), category, code)
             raise
         finally:
             await self.close()
