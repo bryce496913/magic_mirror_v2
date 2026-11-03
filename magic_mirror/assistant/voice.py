@@ -24,6 +24,16 @@ SILENCE_SECONDS = 60
 MAX_TOOL_ARGUMENT_BYTES = 4096
 TOOL_AUDIO_DRAIN = object()
 LOGGER = logging.getLogger(__name__)
+TRANSPORT_REASONS = {
+    "Session duration limit reached": "session_limit",
+    "Session idle timeout reached": "idle_timeout",
+    "Response duration limit reached": "response_timeout",
+    "Realtime connection closed unexpectedly": "connection_closed",
+    "Realtime send failed": "send_failed",
+    "Realtime session is disconnected": "disconnected",
+    "Realtime WebSocket protocol error": "protocol_error",
+    "OpenAI connection failed or timed out": "connect_timeout",
+}
 
 
 def _tool_text_size(value: str) -> int:
@@ -201,8 +211,9 @@ class VoiceConversation:
             finally:
                 stopper.cancel()
                 tool_error.cancel()
-        except RealtimeError:
-            LOGGER.warning("Realtime transport error; voice session recovering")
+        except RealtimeError as exc:
+            LOGGER.warning("Realtime transport error (reason=%s); voice session recovering",
+                           TRANSPORT_REASONS.get(str(exc), "unknown"))
             raise
         finally:
             await self.close()
@@ -397,21 +408,29 @@ class VoiceConversation:
             self._tool_invalid.add(key)
         elif call.item_id:
             self._tool_items[key] = call.item_id
+        # output_item.added can contain an empty or partial argument buffer.
+        # Only *.done and response.done carry completed values for comparison.
+        provisional = event.kind == "response.output_item.added"
+        oversized = call.arguments is not None and _tool_text_size(call.arguments) > MAX_TOOL_ARGUMENT_BYTES
+        if oversized:
+            self._tool_invalid.add(key)
+        arguments = None if provisional or oversized else call.arguments
+        status = None if provisional else call.status
         previous = self._tool_finals.get(key)
         if previous and ((previous.item_id and call.item_id and previous.item_id != call.item_id) or
                          (previous.name and call.name and previous.name != call.name) or
-                         (previous.arguments is not None and call.arguments is not None and
-                          previous.arguments != call.arguments)):
+                         (previous.arguments is not None and arguments is not None and
+                          previous.arguments != arguments) or
+                         (previous.status is not None and status is not None and
+                          previous.status != status)):
             self._tool_invalid.add(key)
-        arguments = call.arguments
-        if arguments is not None and _tool_text_size(arguments) > MAX_TOOL_ARGUMENT_BYTES:
+        if status not in {None, "completed"}:
             self._tool_invalid.add(key)
-            arguments = None
         self._tool_finals[key] = FunctionCall(call.call_id, call.item_id or (previous.item_id if previous else ""),
                                               call.name or (previous.name if previous else ""),
                                               arguments if arguments is not None else
                                               (previous.arguments if previous else None),
-                                              call.status or (previous.status if previous else None))
+                                              status or (previous.status if previous else None))
         if len(self._tool_finals) > 32 or len(self._tool_items) > 32:
             raise VoiceError("Too many OpenAI function call events")
 
@@ -497,8 +516,10 @@ class VoiceConversation:
 
         results = await asyncio.gather(*(run_one(index, call) for index, call in enumerate(calls)))
         if not self._tool_audio_drained.is_set():
+            LOGGER.info("Tool audio drain pending")
             await asyncio.wait_for(self._tool_audio_drained.wait(),
                                    self.settings.audio_timeout + self.settings.audio_buffer_duration + 5)
+            LOGGER.info("Tool audio drain completed")
         for call, result in zip(calls, results, strict=True):
             if generation != self._generation or self.stop_event.is_set():
                 return

@@ -7,7 +7,7 @@ import threading
 
 import pytest
 
-from magic_mirror.assistant.client import RealtimeError
+from magic_mirror.assistant.client import RealtimeClient, RealtimeError
 from magic_mirror.assistant.events import ConversationEvent, ConversationState, EventTracker, FunctionCall
 from magic_mirror.assistant.tools import (Permission, ToolCancelled, ToolDispatcher, ToolRegistry,
                                           ToolSpec, ToolStatus, default_registry)
@@ -105,6 +105,162 @@ def test_raw_realtime_function_sequence_dispatches_and_logs_safe_stages(caplog):
     assert '"arguments"' not in caplog.text and '"capabilities"' not in caplog.text
 
 
+@pytest.mark.parametrize("added_arguments", ["", "{", "{}"])
+def test_provisional_added_arguments_reconcile_with_completed_call_and_spoken_reply(added_arguments, caplog):
+    """Realtime may add an item with an empty argument buffer before final JSON."""
+    async def scenario():
+        voice, audio, client, _, _ = make_voice(tools_enabled=True)
+        tracker = EventTracker(session_id="sess_test", state=ConversationState.READY)
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        raw = [
+            {"type": "input_audio_buffer.speech_started", "item_id": "user"},
+            {"type": "input_audio_buffer.speech_stopped", "item_id": "user"},
+            {"type": "response.created", "response": {"id": "r1"}},
+            {"type": "response.output_item.added", "response_id": "r1", "item": {
+                "id": "i1", "type": "function_call", "call_id": "c1",
+                "name": "get_mirror_capabilities", "arguments": added_arguments}},
+            {"type": "response.function_call_arguments.delta", "response_id": "r1", "item_id": "i1",
+             "call_id": "c1", "delta": "{"},
+            {"type": "response.function_call_arguments.delta", "response_id": "r1", "item_id": "i1",
+             "call_id": "c1", "delta": "}"},
+            {"type": "response.function_call_arguments.done", "response_id": "r1", "item_id": "i1",
+             "call_id": "c1", "name": "get_mirror_capabilities", "arguments": "{}"},
+            {"type": "response.output_item.done", "response_id": "r1", "item": {
+                "id": "i1", "type": "function_call", "status": "completed", "call_id": "c1",
+                "name": "get_mirror_capabilities", "arguments": "{}"}},
+            {"type": "response.done", "response": {"id": "r1", "status": "completed", "output": [{
+                "id": "i1", "type": "function_call", "status": "completed", "call_id": "c1",
+                "name": "get_mirror_capabilities", "arguments": "{}"}]}},
+        ]
+        for payload in raw:
+            client.queue.put_nowait(tracker.parse(payload, 1))
+        await wait_until(lambda: any(item["type"] == "response.create" for item in client.sent))
+        assert len(sent_outputs(client)) == 1
+        assert json.loads(sent_outputs(client)[0]["output"])["status"] == "success"
+        assert sum(item["type"] == "response.create" for item in client.sent) == 1
+        client.queue.put_nowait(event("response.created", response="r2"))
+        client.queue.put_nowait(event("response.output_audio.delta", response="r2", item="spoken",
+                                      audio=pcm_audio()))
+        client.queue.put_nowait(event("response.done", response="r2", status="completed"))
+        await wait_until(lambda: voice.phase == VoicePhase.LISTENING and audio.playback.starts == 1)
+        voice.stop_event.set()
+        await task
+        assert audio.closed and client.closed
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(scenario())
+    assert "Tool get_mirror_capabilities execution result (success)" in caplog.text
+    assert "conflicting_arguments" not in caplog.text
+
+
+def test_completed_item_arguments_conflicting_with_response_done_are_rejected():
+    async def scenario():
+        calls = []
+
+        async def executor(value):
+            calls.append(value)
+            return value
+
+        voice, audio, client, _, _ = make_voice(tools_enabled=True, tool_registry=tool_registry(executor))
+        tracker = EventTracker(session_id="sess_test", state=ConversationState.READY)
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        for payload in (
+            {"type": "input_audio_buffer.speech_started", "item_id": "user"},
+            {"type": "response.created", "response": {"id": "r1"}},
+            {"type": "response.output_item.added", "response_id": "r1", "item": {
+                "id": "i1", "type": "function_call", "call_id": "c1", "name": "safe_echo",
+                "arguments": '{"word":"provisional"}'}},
+            {"type": "response.output_item.done", "response_id": "r1", "item": {
+                "id": "i1", "type": "function_call", "status": "completed", "call_id": "c1",
+                "name": "safe_echo", "arguments": '{"word":"first"}'}},
+            {"type": "response.done", "response": {"id": "r1", "status": "completed", "output": [{
+                "id": "i1", "type": "function_call", "status": "completed", "call_id": "c1",
+                "name": "safe_echo", "arguments": '{"word":"second"}'}]}},
+        ):
+            client.queue.put_nowait(tracker.parse(payload, 1))
+        await wait_until(lambda: any(item["type"] == "response.create" for item in client.sent))
+        assert json.loads(sent_outputs(client)[0]["output"]) == {"status": "invalid_arguments"}
+        assert calls == []
+        voice.stop_event.set()
+        await task
+
+    asyncio.run(scenario())
+
+
+def test_realtime_transport_continuation_and_audio_drain_after_valid_tool(caplog):
+    """Exercise the real client tracker/watchdog with a fake WebSocket and devices."""
+    async def scenario():
+        class Socket:
+            def __init__(self):
+                self.incoming = asyncio.Queue()
+                self.sent = []
+                self.closed = False
+                for payload in (CREATED, UPDATED, UPDATED):
+                    self.incoming.put_nowait(payload)
+
+            async def recv(self):
+                return json.dumps(await self.incoming.get())
+
+            async def send(self, message):
+                payload = json.loads(message)
+                self.sent.append(payload)
+                if payload["type"] == "response.create":
+                    for incoming in (
+                        {"type": "response.created", "response": {"id": "r2"}},
+                        {"type": "response.output_audio.delta", "response_id": "r2",
+                         "item_id": "spoken", "delta": pcm_audio()},
+                        {"type": "response.done", "response": {"id": "r2", "status": "completed", "output": []}},
+                    ):
+                        self.incoming.put_nowait(incoming)
+                elif payload["type"] == "input_audio_buffer.clear":
+                    self.incoming.put_nowait({"type": "input_audio_buffer.cleared"})
+
+            async def close(self):
+                self.closed = True
+
+        socket = Socket()
+
+        async def connector(_url, **_kwargs):
+            return socket
+
+        voice, audio, _, _, _ = make_voice(tools_enabled=True,
+                                          openai_api_key="fixture-only-key",
+                                          realtime_idle_seconds=5,
+                                          realtime_max_response_seconds=10)
+        voice.client = RealtimeClient(voice.settings, connector=connector)
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        for incoming in (
+            {"type": "input_audio_buffer.speech_started", "item_id": "user"},
+            {"type": "input_audio_buffer.speech_stopped", "item_id": "user"},
+            {"type": "response.created", "response": {"id": "r1"}},
+            {"type": "response.output_item.added", "response_id": "r1", "item": {
+                "id": "i1", "type": "function_call", "call_id": "c1", "name": "get_mirror_capabilities",
+                "arguments": ""}},
+            {"type": "response.function_call_arguments.done", "response_id": "r1", "item_id": "i1",
+             "call_id": "c1", "name": "get_mirror_capabilities", "arguments": "{}"},
+            {"type": "response.done", "response": {"id": "r1", "status": "completed", "output": [{
+                "id": "i1", "type": "function_call", "status": "completed", "call_id": "c1",
+                "name": "get_mirror_capabilities", "arguments": "{}"}]}},
+        ):
+            socket.incoming.put_nowait(incoming)
+        await wait_until(lambda: voice.phase == VoicePhase.LISTENING and audio.playback.starts == 1)
+        outputs = [item for item in socket.sent if item["type"] == "conversation.item.create"]
+        assert len(outputs) == 1 and outputs[0]["item"]["call_id"] == "c1"
+        assert json.loads(outputs[0]["item"]["output"])["status"] == "success"
+        assert sum(item["type"] == "response.create" for item in socket.sent) == 1
+        assert voice.client._expiry_reason is None
+        voice.stop_event.set()
+        await task
+        assert socket.closed and audio.closed
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(scenario())
+    assert "Realtime transport error" not in caplog.text
+
+
 @pytest.mark.parametrize("status", ["failed", "incomplete"])
 def test_raw_failed_function_response_is_diagnosed_before_dispatch(status, caplog):
     async def scenario():
@@ -136,14 +292,16 @@ def test_raw_failed_function_response_is_diagnosed_before_dispatch(status, caplo
     assert "never log this value" not in caplog.text
 
 
-def test_continuation_send_failure_closes_voice_after_one_local_execution(caplog):
+@pytest.mark.parametrize("failure,reason", [("Realtime send failed", "send_failed"),
+                                            ("private transport detail", "unknown")])
+def test_continuation_send_failure_closes_voice_after_one_local_execution(failure, reason, caplog):
     async def scenario():
         voice, audio, client, _, _ = make_voice(tools_enabled=True)
         original_send = client.send
 
         async def reject_continuation(payload):
             if payload["type"] == "response.create":
-                raise RealtimeError("private transport detail")
+                raise RealtimeError(failure)
             await original_send(payload)
 
         client.send = reject_continuation
@@ -152,7 +310,7 @@ def test_continuation_send_failure_closes_voice_after_one_local_execution(caplog
         client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user"))
         client.queue.put_nowait(event("response.created", response="r1"))
         client.queue.put_nowait(tool_done("r1", tool_call("c1")))
-        with pytest.raises(RealtimeError, match="private transport detail"):
+        with pytest.raises(RealtimeError, match=failure):
             await task
         assert len(sent_outputs(client)) == 1
         assert audio.closed and client.closed
@@ -161,7 +319,7 @@ def test_continuation_send_failure_closes_voice_after_one_local_execution(caplog
         asyncio.run(scenario())
     assert "Function output submitted (status=success)" in caplog.text
     assert "Response continuation requested" not in caplog.text
-    assert "Realtime transport error" in caplog.text
+    assert f"Realtime transport error (reason={reason})" in caplog.text
     assert "private transport detail" not in caplog.text
 
 
