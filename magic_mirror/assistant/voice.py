@@ -248,6 +248,8 @@ class VoiceConversation:
     async def _receive_loop(self) -> None:
         while not self.stop_event.is_set():
             event = await self.client.receive()
+            if event.kind == "response.created" and self._awaiting_tool_response:
+                LOGGER.info("Response continuation started")
             await self.handle_event(event)
 
     async def _silence_loop(self) -> None:

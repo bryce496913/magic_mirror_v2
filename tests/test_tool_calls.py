@@ -263,6 +263,7 @@ def test_realtime_transport_continuation_and_audio_drain_after_valid_tool(caplog
     with caplog.at_level(logging.INFO):
         asyncio.run(scenario())
     assert "Realtime transport error" not in caplog.text
+    assert caplog.text.count("Response continuation started") == 1
 
 
 def test_remote_close_after_tool_continuation_releases_audio_and_logs_only_safe_details(caplog):
@@ -321,6 +322,7 @@ def test_remote_close_after_tool_continuation_releases_audio_and_logs_only_safe_
     with caplog.at_level(logging.INFO):
         asyncio.run(scenario())
     assert "close_category=remote_error close_code=1011" in caplog.text
+    assert "Response continuation started" not in caplog.text
     assert "private-provider-reason" not in caplog.text
 
 
