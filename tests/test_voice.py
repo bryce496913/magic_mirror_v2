@@ -12,7 +12,7 @@ from magic_mirror.assistant.client import RealtimeError
 from magic_mirror.assistant.display import AssistantStateStore
 from magic_mirror.assistant.events import ConversationEvent, ConversationState
 from magic_mirror.assistant.resample import PCMRateError, StreamingPCM, StreamingPeakLimiter
-from magic_mirror.assistant.voice import Transcript, VoiceConversation, VoiceError, VoicePhase
+from magic_mirror.assistant.voice import VoiceConversation, VoiceError, VoicePhase
 from magic_mirror.assistant.wake import WakeState
 from magic_mirror.assistant.voice_cli import main as cli_main
 from magic_mirror.audio import AudioError
@@ -140,7 +140,7 @@ class FakeClient:
         self.closed = True
 
 
-def make_voice(**options):
+def make_voice(*, tool_registry=None, **options):
     audio, client = FakeAudio(), FakeClient()
     values = dict(audio_capture_rate=48000, audio_playback_rate=48000,
                   audio_capture_channels=1, audio_playback_channels=1,
@@ -150,7 +150,8 @@ def make_voice(**options):
     transcripts = []
     latencies = []
     voice = VoiceConversation(settings, audio=audio, client=client,
-                              on_transcript=transcripts.append, on_latency=latencies.append)
+                              on_transcript=transcripts.append, on_latency=latencies.append,
+                              tool_registry=tool_registry)
     client.queue.put_nowait(event("session.updated"))
     return voice, audio, client, transcripts, latencies
 

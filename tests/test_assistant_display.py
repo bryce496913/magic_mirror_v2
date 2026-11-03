@@ -9,7 +9,7 @@ import pytest
 from magic_mirror import create_app
 from magic_mirror.assistant.display import (AssistantStateServer, AssistantStateStore,
                                             acquire_owner_lock, read_snapshot)
-from magic_mirror.assistant.events import (ConversationEvent, ConversationState,
+from magic_mirror.assistant.events import (ConversationEvent, ConversationState, EventTracker,
                                            PlaybackAction, PlaybackEvent)
 from magic_mirror.assistant.wake import WakeState
 from magic_mirror.assistant.wake_cli import led_state_for
@@ -57,6 +57,126 @@ def test_current_exchange_correlates_transcripts_and_actual_playback():
     store.on_state(WakeState.RETURNING_IDLE)
     store.on_state(WakeState.IDLE)
     assert not store.snapshot().user_text and not store.snapshot().assistant_text
+
+
+@pytest.mark.parametrize("completion_order", ["before_playback", "during_playback", "after_playback"])
+def test_tool_continuation_can_display_completed_audio_transcript_from_response_done(completion_order):
+    store = AssistantStateStore()
+    tracker = EventTracker(session_id="session", state=ConversationState.READY)
+    store.on_state(WakeState.LISTENING)
+    store.on_event(event("input_audio_buffer.speech_started", item="user"))
+    store.on_event(event("conversation.item.input_audio_transcription.completed", item="user",
+                         role="user", text="What can you do?", final=True))
+    store.on_event(event("response.created", response="tool-response"))
+    store.on_event(event("response.done", response="tool-response", status="completed"))
+    store.on_event(event("response.created", response="spoken-response"))
+    if completion_order != "before_playback":
+        store.on_playback(PlaybackEvent(PlaybackAction.STARTED, "spoken-response"))
+    if completion_order == "after_playback":
+        store.on_playback(PlaybackEvent(PlaybackAction.COMPLETED, "spoken-response"))
+    completed = tracker.parse({"type": "response.done", "response": {
+        "id": "spoken-response", "status": "completed", "output": [{
+            "id": "spoken-item", "type": "message", "role": "assistant", "status": "completed",
+            "content": [{"type": "output_audio", "transcript": "I can talk with you."}]}]}}, 1)
+    store.on_event(completed)
+    if completion_order == "before_playback":
+        assert store.snapshot().assistant_text == ""
+        store.on_playback(PlaybackEvent(PlaybackAction.STARTED, "spoken-response"))
+    if completion_order != "after_playback":
+        store.on_playback(PlaybackEvent(PlaybackAction.COMPLETED, "spoken-response"))
+    store.on_event(event("response.output_audio_transcript.delta", response="spoken-response",
+                         item="spoken-item", role="assistant", text="Late duplicate"))
+    store.on_state(WakeState.LISTENING)
+    snap = store.snapshot()
+    assert (snap.user_text, snap.assistant_text, snap.assistant_final, snap.playback) == (
+        "What can you do?", "I can talk with you.", True, False)
+
+
+@pytest.mark.parametrize("transcript_after_playback", [False, True])
+def test_streaming_audio_transcript_before_or_after_playback_completion(transcript_after_playback):
+    store = AssistantStateStore()
+    store.on_state(WakeState.LISTENING)
+    store.on_event(event("input_audio_buffer.speech_started", item="u"))
+    store.on_event(event("response.created", response="spoken"))
+    if transcript_after_playback:
+        store.on_playback(PlaybackEvent(PlaybackAction.STARTED, "spoken"))
+        store.on_playback(PlaybackEvent(PlaybackAction.COMPLETED, "spoken"))
+    store.on_event(event("response.output_audio_transcript.delta", response="spoken",
+                         item="a", role="assistant", text="I can "))
+    store.on_event(event("response.output_audio_transcript.done", response="spoken",
+                         item="a", role="assistant", text="I can help.", final=True))
+    if not transcript_after_playback:
+        assert store.snapshot().assistant_text == ""  # no audio was heard yet
+        store.on_playback(PlaybackEvent(PlaybackAction.STARTED, "spoken"))
+        store.on_playback(PlaybackEvent(PlaybackAction.COMPLETED, "spoken"))
+    store.on_state(WakeState.LISTENING)
+    assert store.snapshot().assistant_text == "I can help."
+    assert store.snapshot().assistant_final and not store.snapshot().playback
+
+
+def test_late_transcript_cannot_resurrect_unplayed_cancelled_or_sleeping_answer():
+    store = AssistantStateStore()
+    store.on_state(WakeState.LISTENING)
+    store.on_event(event("input_audio_buffer.speech_started", item="u"))
+    store.on_event(event("response.created", response="r1"))
+    store.on_playback(PlaybackEvent(PlaybackAction.COMPLETED, "r1"))
+    store.on_event(event("response.output_audio_transcript.done", response="r1",
+                         item="a1", role="assistant", text="Unheard", final=True))
+    assert not store.snapshot().assistant_text
+    store.on_event(event("response.created", response="r2"))
+    store.on_playback(PlaybackEvent(PlaybackAction.STARTED, "r2"))
+    store.on_event(event("response.output_audio_transcript.done", response="r2",
+                         item="a2", role="assistant", text="Interrupted", final=True))
+    store.on_playback(PlaybackEvent(PlaybackAction.INTERRUPTED, "r2"))
+    store.on_event(event("response.output_audio_transcript.done", response="r2",
+                         item="a2", role="assistant", text="Stale", final=True))
+    assert not store.snapshot().assistant_text
+    store.on_state(WakeState.IDLE)
+    assert not store.snapshot().user_text and not store.snapshot().assistant_text
+
+
+def test_cancelled_tool_continuation_cannot_restore_response_done_audio_text():
+    store = AssistantStateStore()
+    tracker = EventTracker(session_id="session", state=ConversationState.READY)
+    store.on_state(WakeState.LISTENING)
+    store.on_event(event("input_audio_buffer.speech_started", item="u1"))
+    store.on_event(event("response.created", response="tool"))
+    store.on_event(event("response.done", response="tool", status="completed"))
+    store.on_event(event("response.created", response="spoken"))
+    store.on_playback(PlaybackEvent(PlaybackAction.STARTED, "spoken"))
+    store.on_playback(PlaybackEvent(PlaybackAction.INTERRUPTED, "spoken"))
+    late = tracker.parse({"type": "response.done", "response": {
+        "id": "spoken", "status": "completed", "output": [{"id": "a", "type": "message",
+            "role": "assistant", "content": [{"type": "output_audio", "transcript": "Old answer"}]}]}}, 1)
+    store.on_event(late)
+    assert not store.snapshot().assistant_text
+    store.on_event(event("input_audio_buffer.speech_started", item="u2"))
+    store.on_event(event("response.created", response="next"))
+    store.on_playback(PlaybackEvent(PlaybackAction.STARTED, "next"))
+    store.on_event(late)
+    assert not store.snapshot().assistant_text
+    store.on_state(WakeState.IDLE)
+    assert not store.snapshot().assistant_text
+
+
+def test_tool_response_and_unspoken_output_text_never_become_dashboard_answer():
+    store = AssistantStateStore()
+    tracker = EventTracker(session_id="session", state=ConversationState.READY)
+    store.on_state(WakeState.LISTENING)
+    store.on_event(event("input_audio_buffer.speech_started", item="u"))
+    store.on_event(event("response.created", response="tool"))
+    tool = tracker.parse({"type": "response.done", "response": {
+        "id": "tool", "status": "completed", "output": [{"type": "function_call", "id": "i",
+            "call_id": "c", "name": "get_mirror_capabilities", "arguments": '{"hidden":"private"}'}]}}, 1)
+    store.on_event(tool)
+    assert not store.snapshot().assistant_text
+    store.on_event(event("response.created", response="spoken"))
+    store.on_playback(PlaybackEvent(PlaybackAction.STARTED, "spoken"))
+    unspoken = tracker.parse({"type": "response.done", "response": {
+        "id": "spoken", "status": "completed", "output": [{"type": "message", "role": "assistant",
+            "id": "text", "content": [{"type": "output_text", "text": "Internal only"}]}]}}, 2)
+    store.on_event(unspoken)
+    assert not store.snapshot().assistant_text
 
 
 def test_interrupt_failure_late_events_and_restart_cannot_leave_stale_answer():
@@ -313,8 +433,26 @@ def test_dashboard_state_endpoint_is_loopback_only_and_read_only(monkeypatch):
 
     monkeypatch.setattr("magic_mirror.dashboard.routes.read_snapshot",
                         lambda: (_ for _ in ()).throw(FileNotFoundError()))
-    assert client.get("/api/assistant").json == {"state": "unavailable"}
+    unavailable = client.get("/api/assistant")
+    assert unavailable.json == {"state": "unavailable"}
+    assert unavailable.headers["X-Mirror-Assistant-Read-Status"] == "socket_missing"
     assert create_app(Settings()).test_client().get("/api/assistant").json == {"state": "disabled"}
+
+
+@pytest.mark.parametrize("error,reason", [(PermissionError(), "socket_denied"),
+                                          (TimeoutError(), "socket_timeout"),
+                                          (ConnectionRefusedError(), "socket_refused"),
+                                          (ValueError(), "invalid_snapshot")])
+def test_unavailable_snapshot_reports_only_sanitized_local_read_reason(monkeypatch, error, reason):
+    app = create_app(Settings(wake_enabled=True))
+
+    def fail():
+        raise error
+
+    monkeypatch.setattr("magic_mirror.dashboard.routes.read_snapshot", fail)
+    response = app.test_client().get("/api/assistant")
+    assert response.json == {"state": "unavailable"}
+    assert response.headers["X-Mirror-Assistant-Read-Status"] == reason
 
 
 def test_browser_refresh_reads_live_owner_snapshot(monkeypatch, tmp_path):
@@ -339,6 +477,72 @@ def test_browser_refresh_reads_live_owner_snapshot(monkeypatch, tmp_path):
         finally:
             await server.close()
         assert app.test_client().get("/api/assistant").json == {"state": "unavailable"}
+    asyncio.run(scenario())
+
+
+def test_dashboard_refresh_during_tool_call_and_after_spoken_reply(monkeypatch, tmp_path):
+    async def scenario():
+        path = tmp_path / "private" / "state.sock"
+        store = AssistantStateStore()
+        server = AssistantStateServer(store, path)
+        monkeypatch.setattr("magic_mirror.dashboard.routes.read_snapshot", lambda: read_snapshot(path))
+        app = create_app(Settings(wake_enabled=True))
+        await server.start()
+        try:
+            store.on_state(WakeState.LISTENING)
+            store.on_event(event("input_audio_buffer.speech_started", item="u"))
+            store.on_event(event("conversation.item.input_audio_transcription.completed",
+                                 item="u", role="user", text="Capabilities?", final=True))
+            store.on_event(event("response.created", response="tool-response"))
+            during = await asyncio.to_thread(lambda: app.test_client().get("/api/assistant"))
+            assert during.status_code == 200 and during.json["user_text"] == "Capabilities?"
+            assert during.json["assistant_text"] == ""
+            store.on_event(event("response.done", response="tool-response", status="completed"))
+            store.on_event(event("response.created", response="spoken-response"))
+            store.on_playback(PlaybackEvent(PlaybackAction.STARTED, "spoken-response"))
+            tracker = EventTracker(session_id="session", state=ConversationState.READY)
+            store.on_event(tracker.parse({"type": "response.done", "response": {
+                "id": "spoken-response", "status": "completed", "output": [{
+                    "id": "spoken-item", "type": "message", "role": "assistant",
+                    "content": [{"type": "output_audio", "transcript": "I can answer questions."}]}]}}, 1))
+            store.on_playback(PlaybackEvent(PlaybackAction.COMPLETED, "spoken-response"))
+            store.on_state(WakeState.LISTENING)
+            for _ in range(2):  # a fresh browser read must restore the current exchange
+                refreshed = await asyncio.to_thread(lambda: app.test_client().get("/api/assistant"))
+                assert refreshed.status_code == 200
+                assert refreshed.json["assistant_text"] == "I can answer questions."
+                assert refreshed.json["assistant_final"] is True
+                assert refreshed.json["state"] == "listening"
+            store.on_state(WakeState.IDLE)
+            idle = await asyncio.to_thread(lambda: app.test_client().get("/api/assistant"))
+            assert idle.json["assistant_text"] == ""
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_private_snapshot_remains_readable_with_bounded_unicode_transcripts(tmp_path):
+    async def scenario():
+        path = tmp_path / "private" / "state.sock"
+        store = AssistantStateStore()
+        server = AssistantStateServer(store, path)
+        store.on_state(WakeState.LISTENING)
+        store.on_event(event("input_audio_buffer.speech_started", item="u"))
+        store.on_event(event("conversation.item.input_audio_transcription.completed", item="u",
+                             role="user", text="🔊" * 240, final=True))
+        store.on_event(event("response.created", response="r"))
+        store.on_playback(PlaybackEvent(PlaybackAction.STARTED, "r"))
+        store.on_event(event("response.output_audio_transcript.done", response="r", item="a",
+                             role="assistant", text="🔊" * 240, final=True))
+        await server.start()
+        try:
+            snapshot = await asyncio.to_thread(read_snapshot, path)
+            assert snapshot["user_text"] == "🔊" * 240
+            assert snapshot["assistant_text"] == "🔊" * 240
+        finally:
+            await server.close()
+
     asyncio.run(scenario())
 
 

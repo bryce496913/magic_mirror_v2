@@ -122,6 +122,11 @@ class Settings:
     realtime_connect_timeout: int = 10
     realtime_retry_limit: int = 2
     realtime_backoff_seconds: float = 1.0
+    tools_enabled: bool = False
+    tool_timeout_seconds: float = 5.0
+    tool_concurrency: int = 2
+    tool_max_output_bytes: int = 1024
+    tool_max_calls: int = 4
     wake_enabled: bool = False
     wake_phrase: str = "magic mirror"
     wake_model_dir: str = ""
@@ -279,6 +284,11 @@ class Settings:
                    realtime_connect_timeout=_audio_int(values, "MIRROR_REALTIME_CONNECT_TIMEOUT", 10, 1, 60),
                    realtime_retry_limit=_audio_int(values, "MIRROR_REALTIME_RETRY_LIMIT", 2, 0, 5),
                    realtime_backoff_seconds=_audio_float(values, "MIRROR_REALTIME_BACKOFF_SECONDS", 1.0, 0.1, 10.0),
+                   tools_enabled=_bool(values, "MIRROR_TOOLS_ENABLED", False),
+                   tool_timeout_seconds=_audio_float(values, "MIRROR_TOOL_TIMEOUT_SECONDS", 5.0, 0.1, 30.0),
+                   tool_concurrency=_audio_int(values, "MIRROR_TOOL_CONCURRENCY", 2, 1, 4),
+                   tool_max_output_bytes=_audio_int(values, "MIRROR_TOOL_MAX_OUTPUT_BYTES", 1024, 64, 8192),
+                   tool_max_calls=_audio_int(values, "MIRROR_TOOL_MAX_CALLS", 4, 1, 8),
                    wake_enabled=wake_enabled, wake_phrase=wake_phrase, wake_model_dir=wake_model_dir,
                    wake_cooldown_seconds=_audio_float(values, "MIRROR_WAKE_COOLDOWN_SECONDS", 5.0, 0.5, 30.0),
                    wake_first_speech_seconds=_audio_int(values, "MIRROR_WAKE_FIRST_SPEECH_SECONDS", 8, 3, 60),

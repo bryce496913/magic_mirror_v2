@@ -10,7 +10,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from ..audio import AudioError
-from ..config import ConfigurationError, Settings
+from ..config import ConfigurationError, Settings, configure_logging
 from ..hardware.led import LedError, RGBLedController
 from .display import AssistantStateServer, AssistantStateStore
 from .client import RealtimeError
@@ -115,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         settings = Settings.from_env()
         if not settings.wake_enabled:
             raise WakeError("MIRROR_WAKE_ENABLED=false; enable it in the ignored local .env first")
+        configure_logging(settings.log_level)
         asyncio.run(_interactive(settings))
     except (ConfigurationError, WakeError, AudioError, LedError, OSError, RuntimeError) as exc:
         print(f"Wake detector error: {exc}", file=sys.stderr)
