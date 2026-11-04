@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Callable
 from typing import Any
@@ -12,6 +13,8 @@ from websockets.exceptions import ConnectionClosed, ConnectionClosedOK, InvalidS
 
 from ..config import Settings
 from .events import ConversationEvent, ConversationState, EventTracker
+
+LOGGER = logging.getLogger(__name__)
 
 
 class RealtimeError(RuntimeError):
@@ -165,9 +168,11 @@ class RealtimeClient:
             deadline, reason = self._deadline()
             remaining = deadline - self.clock()
             if remaining <= 0:
-                if self.clock() < self._deadline()[0]:
+                current_deadline, reason = self._deadline()
+                if self.clock() < current_deadline:
                     continue
                 self._expiry_reason = reason
+                LOGGER.warning("Realtime watchdog timeout (category=%s)", self._timeout_category(reason))
                 await self.close()
                 return
             try:
@@ -178,11 +183,21 @@ class RealtimeClient:
                 async with asyncio.timeout(remaining):
                     await self._activity.wait()
             except TimeoutError:
-                if self.socket is not None and self.clock() < self._deadline()[0]:
+                if self.socket is None or self.started_at is None:
+                    return
+                current_deadline, reason = self._deadline()
+                if self.clock() < current_deadline:
                     continue
                 self._expiry_reason = reason
+                LOGGER.warning("Realtime watchdog timeout (category=%s)", self._timeout_category(reason))
                 await self.close()
                 return
+
+    @staticmethod
+    def _timeout_category(reason: str) -> str:
+        return {"Session duration limit reached": "session_limit",
+                "Session idle timeout reached": "idle_timeout",
+                "Response duration limit reached": "response_limit"}.get(reason, "unknown")
 
     async def send(self, payload: dict[str, Any]) -> None:
         if self.socket is not None and self.started_at is not None:

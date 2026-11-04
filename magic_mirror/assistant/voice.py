@@ -24,6 +24,7 @@ CHUNK_MS = 100
 SILENCE_SECONDS = 60
 MAX_TOOL_ARGUMENT_BYTES = 4096
 TOOL_AUDIO_DRAIN = object()
+CONTINUATION_AUDIO_START_SECONDS = 30
 LOGGER = logging.getLogger(__name__)
 TRANSPORT_REASONS = {
     "Session duration limit reached": "session_limit",
@@ -110,6 +111,10 @@ class VoiceConversation:
         self._tool_audio_drained.set()
         self._tool_output_started = False
         self._awaiting_tool_response = False
+        self._continuation_started = False
+        self._continuation_audio_seen = False
+        self._continuation_text_seen = False
+        self._continuation_audio_deadline: float | None = None
         self.clock = clock
         self.transcripts: dict[tuple[str, str, int], Transcript] = {}
         self.stop_event = asyncio.Event()
@@ -242,8 +247,12 @@ class VoiceConversation:
                 } else "unknown"
                 code = (exc.close_code if isinstance(exc.close_code, int) and
                         1000 <= exc.close_code <= 4999 else "none")
-                LOGGER.warning("Realtime transport error (reason=%s); close_category=%s close_code=%s; voice session recovering",
-                               TRANSPORT_REASONS.get(str(exc), "unknown"), category, code)
+                continuation = ("awaiting_response" if self._awaiting_tool_response else
+                                "awaiting_audio" if self._continuation_audio_deadline is not None else
+                                "audio_started" if self._continuation_started and self._continuation_audio_seen else
+                                "none")
+                LOGGER.warning("Realtime transport error (reason=%s); close_category=%s close_code=%s continuation=%s; voice session recovering",
+                               TRANSPORT_REASONS.get(str(exc), "unknown"), category, code, continuation)
             raise
         finally:
             await self.close()
@@ -270,7 +279,19 @@ class VoiceConversation:
 
     async def _receive_loop(self) -> None:
         while not self.stop_event.is_set():
-            event = await self.client.receive()
+            if self._continuation_audio_deadline is None:
+                event = await self.client.receive()
+            else:
+                remaining = self._continuation_audio_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    LOGGER.warning("Realtime continuation timeout (category=first_audio)")
+                    raise VoiceError("OpenAI continuation did not start audio in time")
+                try:
+                    async with asyncio.timeout(remaining):
+                        event = await self.client.receive()
+                except TimeoutError:
+                    LOGGER.warning("Realtime continuation timeout (category=first_audio)")
+                    raise VoiceError("OpenAI continuation did not start audio in time") from None
             if event.kind == "response.created" and self._awaiting_tool_response:
                 LOGGER.info("Response continuation started")
             await self.handle_event(event)
@@ -559,14 +580,18 @@ class VoiceConversation:
             if generation != self._generation or self.stop_event.is_set():
                 return
             self._tool_output_started = True
+            output = result.json()
             await self.client.send({"type": "conversation.item.create", "item": {
-                "type": "function_call_output", "call_id": call.call_id, "output": result.json()}})
+                "type": "function_call_output", "call_id": call.call_id, "output": output}})
             LOGGER.info("Function output submitted (status=%s)", result.status.value)
             if call.name == "search_web" and call.call_id not in blocked_search:
                 availability = (result.data.get("availability") if result.data and
                                 result.status == ToolStatus.SUCCESS else None)
-                LOGGER.info("Search retrieval (status=%s)",
-                            "cited" if availability == "available" else "unavailable")
+                source_items = result.data.get("sources") if result.data else None
+                source_count = min(len(source_items), 3) if isinstance(source_items, list) else 0
+                LOGGER.info("Search retrieval (status=%s) sources=%d output_bytes=%d",
+                            "cited" if availability == "available" and source_count else "unavailable",
+                            source_count, len(output.encode("utf-8")))
             if call.name == "search_web" and call.call_id not in blocked_search and self.on_sources is not None:
                 sources = result.data.get("sources", []) if result.data and result.status == ToolStatus.SUCCESS else []
                 self.on_sources(tuple({"title": item.get("title") or item["source_name"], "url": item["url"]}
@@ -577,9 +602,10 @@ class VoiceConversation:
         self._awaiting_tool_response = True
         continuation = {"type": "response.create"}
         if self._tool_count >= self.settings.tool_max_calls or self._search_attempted_this_turn:
-            continuation["response"] = {"tool_choice": "none", "tools": []}
+            continuation["response"] = {"tool_choice": "none", "output_modalities": ["audio"]}
         await self.client.send(continuation)
-        LOGGER.info("Response continuation requested")
+        LOGGER.info("Response continuation requested (tool_choice=%s, output=audio)",
+                    "none" if "response" in continuation else "session_default")
 
     async def _start_tool_calls(self, event: ConversationEvent) -> None:
         if not self._turn_pending:
@@ -690,6 +716,13 @@ class VoiceConversation:
                     self._awaiting_tool_response = False
                     self._tool_source_response = None
                     self._tool_output_started = False
+                    self._continuation_started = True
+                    self._continuation_audio_seen = False
+                    self._continuation_text_seen = False
+                    self._continuation_audio_deadline = (asyncio.get_running_loop().time() +
+                                                         min(CONTINUATION_AUDIO_START_SECONDS,
+                                                             self.settings.realtime_max_response_seconds))
+                    LOGGER.info("Realtime response created (continuation=true, output=audio)")
                 if self._completed_turn and not self._turn_pending:
                     raise VoiceError("Unexpected response without a new user turn")
                 await self._mute_input(VoicePhase.RESPONDING)
@@ -715,6 +748,10 @@ class VoiceConversation:
                 raise VoiceError("OpenAI sent invalid audio data") from None
             if not raw or len(raw) % 2 or len(raw) > API_RATE * 2:
                 raise VoiceError("OpenAI audio chunk has invalid length")
+            if self._continuation_started and not self._continuation_audio_seen:
+                LOGGER.info("Realtime continuation first audio received")
+                self._continuation_audio_seen = True
+                self._continuation_audio_deadline = None
             if self._audio_item and self._audio_item != event.item_id:
                 raise VoiceError("Multiple audio items in one response are unsupported")
             self._audio_item = event.item_id
@@ -736,11 +773,21 @@ class VoiceConversation:
                 status = event.status if event.status in {"completed", "cancelled", "failed", "incomplete"} else "unknown"
                 LOGGER.info("Realtime response completed (status=%s, function_calls=%d)",
                             status, len(event.tool_calls))
+                if self._continuation_started:
+                    LOGGER.info("Realtime continuation completed (status=%s, first_audio=%s)",
+                                status, self._continuation_audio_seen)
+            self._continuation_audio_deadline = None
             if event.status == "completed":
                 if event.tool_calls:
                     await self._start_tool_calls(event)
                 else:
+                    if self._continuation_started and not self._continuation_audio_seen:
+                        LOGGER.warning("Realtime continuation completed without audio (text_event=%s)",
+                                       self._continuation_text_seen)
+                        await self._interrupt_output()
+                        raise VoiceError("OpenAI continuation completed without audio")
                     await self._output.put((self._generation, event.response_id, None))
+                self._continuation_started = False
             elif event.status == "cancelled":
                 await self._interrupt_output()
                 task = asyncio.create_task(self._resume_cancelled_response(self._generation))
@@ -762,6 +809,10 @@ class VoiceConversation:
             if self.on_event is not None:
                 self.on_event(event)
             raise VoiceError(f"OpenAI session error ({_error_code(event.error_code) or 'unknown'})")
+        if (kind.startswith("response.output_text.") and self._continuation_started and
+                event.response_id == self._current_response and not self._continuation_text_seen):
+            LOGGER.info("Realtime continuation text event received")
+            self._continuation_text_seen = True
         if event.role in {"user", "assistant"} and event.text is not None and event.item_id:
             if event.response_id in self._blocked:
                 return
