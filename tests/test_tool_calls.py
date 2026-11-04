@@ -482,6 +482,83 @@ def test_registered_tool_keeps_half_duplex_until_spoken_continuation_finishes():
     asyncio.run(scenario())
 
 
+def test_weather_result_correlates_with_spoken_continuation(monkeypatch):
+    from magic_mirror.assistant.tools.weather import WeatherTools
+
+    async def forecast(_self, arguments):
+        assert arguments == {"period": "tomorrow"}
+        return {"availability": "available", "location": "New York", "period": "tomorrow",
+                "days": [{"date": "2026-11-03", "high": {
+                    "fahrenheit": 59.0, "celsius": 15.0, "value": 15.0, "unit": "°C"}}]}
+
+    monkeypatch.setattr(WeatherTools, "forecast", forecast)
+
+    async def scenario():
+        voice, audio, client, _, _ = make_voice(tools_enabled=True)
+        task = asyncio.create_task(voice.run())
+        try:
+            await wait_until(lambda: audio.capture.active)
+            instructions = next(x["session"]["instructions"] for x in client.sent
+                                if x["type"] == "session.update")
+            assert "Fahrenheit value first, then its Celsius value" in instructions
+            client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user"))
+            client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="user"))
+            client.queue.put_nowait(event("response.created", response="weather-call"))
+            call = tool_call("weather-id", name="get_weather_forecast",
+                             arguments='{"period":"tomorrow"}', item_id="forecast-item")
+            client.queue.put_nowait(tool_done("weather-call", call))
+            await wait_until(lambda: any(x["type"] == "response.create" for x in client.sent))
+            output = sent_outputs(client)
+            assert len(output) == 1 and output[0]["call_id"] == "weather-id"
+            high = json.loads(output[0]["output"])["data"]["days"][0]["high"]
+            assert high["fahrenheit"] == 59.0 and high["celsius"] == 15.0
+            assert voice.phase == VoicePhase.PROCESSING and audio.playback.starts == 0
+            client.queue.put_nowait(event("response.created", response="spoken-weather"))
+            client.queue.put_nowait(event("response.output_audio.delta", response="spoken-weather",
+                                          item="audio", audio=pcm_audio()))
+            client.queue.put_nowait(event("response.done", response="spoken-weather", status="completed"))
+            await wait_until(lambda: audio.playback.starts == 1 and voice.phase == VoicePhase.LISTENING)
+        finally:
+            voice.stop_event.set()
+            await task
+
+    asyncio.run(scenario())
+
+
+def test_weather_timeout_submits_bounded_failure_and_spoken_continuation(monkeypatch):
+    from magic_mirror.assistant.tools.weather import WeatherTools
+
+    async def stalled_forecast(_self, _arguments):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(WeatherTools, "forecast", stalled_forecast)
+
+    async def scenario():
+        voice, audio, client, _, _ = make_voice(tools_enabled=True, tool_timeout_seconds=0.02)
+        task = asyncio.create_task(voice.run())
+        try:
+            await wait_until(lambda: audio.capture.active)
+            client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user"))
+            client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="user"))
+            client.queue.put_nowait(event("response.created", response="weather-call"))
+            call = tool_call("weather-id", name="get_weather_forecast",
+                             arguments='{"period":"tomorrow"}', item_id="forecast-item")
+            client.queue.put_nowait(tool_done("weather-call", call))
+            await wait_until(lambda: any(x["type"] == "response.create" for x in client.sent))
+            assert json.loads(sent_outputs(client)[0]["output"]) == {"status": "timeout"}
+            assert voice.phase == VoicePhase.PROCESSING and audio.playback.starts == 0
+            client.queue.put_nowait(event("response.created", response="spoken-timeout"))
+            client.queue.put_nowait(event("response.output_audio.delta", response="spoken-timeout",
+                                          item="audio", audio=pcm_audio()))
+            client.queue.put_nowait(event("response.done", response="spoken-timeout", status="completed"))
+            await wait_until(lambda: audio.playback.starts == 1 and voice.phase == VoicePhase.LISTENING)
+        finally:
+            voice.stop_event.set()
+            await task
+
+    asyncio.run(scenario())
+
+
 def test_audio_before_function_call_drains_before_tool_continuation():
     class GatedPlayback(FakePlayback):
         def __init__(self):
@@ -948,7 +1025,8 @@ def test_tool_configuration_defaults_validation_and_registry_guards():
             Settings.from_env({name: value})
     registry = default_registry(Settings())
     assert registry.declarations() == []
-    assert len(default_registry(enabled).declarations()) == 1
+    assert {item["name"] for item in default_registry(enabled).declarations()} == {
+        "get_mirror_capabilities", "get_current_weather", "get_weather_forecast"}
     with pytest.raises(ValueError, match="duplicate"):
         spec = registry._tools["get_mirror_capabilities"]
         registry.register(spec)
