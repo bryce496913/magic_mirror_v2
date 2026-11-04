@@ -488,7 +488,8 @@ def test_weather_result_correlates_with_spoken_continuation(monkeypatch):
     async def forecast(_self, arguments):
         assert arguments == {"period": "tomorrow"}
         return {"availability": "available", "location": "New York", "period": "tomorrow",
-                "days": [{"date": "2026-11-03", "high": {"value": 15, "unit": "°C"}}]}
+                "days": [{"date": "2026-11-03", "high": {
+                    "fahrenheit": 59.0, "celsius": 15.0, "value": 15.0, "unit": "°C"}}]}
 
     monkeypatch.setattr(WeatherTools, "forecast", forecast)
 
@@ -497,6 +498,9 @@ def test_weather_result_correlates_with_spoken_continuation(monkeypatch):
         task = asyncio.create_task(voice.run())
         try:
             await wait_until(lambda: audio.capture.active)
+            instructions = next(x["session"]["instructions"] for x in client.sent
+                                if x["type"] == "session.update")
+            assert "Fahrenheit value first, then its Celsius value" in instructions
             client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user"))
             client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="user"))
             client.queue.put_nowait(event("response.created", response="weather-call"))
@@ -506,7 +510,8 @@ def test_weather_result_correlates_with_spoken_continuation(monkeypatch):
             await wait_until(lambda: any(x["type"] == "response.create" for x in client.sent))
             output = sent_outputs(client)
             assert len(output) == 1 and output[0]["call_id"] == "weather-id"
-            assert json.loads(output[0]["output"])["data"]["days"][0]["high"]["value"] == 15
+            high = json.loads(output[0]["output"])["data"]["days"][0]["high"]
+            assert high["fahrenheit"] == 59.0 and high["celsius"] == 15.0
             assert voice.phase == VoicePhase.PROCESSING and audio.playback.starts == 0
             client.queue.put_nowait(event("response.created", response="spoken-weather"))
             client.queue.put_nowait(event("response.output_audio.delta", response="spoken-weather",
