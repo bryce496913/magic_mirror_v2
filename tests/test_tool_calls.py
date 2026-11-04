@@ -595,6 +595,8 @@ def test_search_citations_wait_for_matching_spoken_audio_and_clear_on_new_turn(m
             output = sent_outputs(client)
             assert output[0]["call_id"] == "search-id"
             assert json.loads(output[0]["output"])["data"]["sources"][0]["title"] == "Official release"
+            assert [x for x in client.sent if x["type"] == "response.create"] == [
+                {"type": "response.create", "response": {"tool_choice": "none", "tools": []}}]
             assert store.snapshot().sources and not store.snapshot().assistant_text
             assert voice.phase == VoicePhase.PROCESSING and audio.playback.starts == 0
             client.queue.put_nowait(event("response.created", response="spoken-search"))
@@ -613,6 +615,199 @@ def test_search_citations_wait_for_matching_spoken_audio_and_clear_on_new_turn(m
             await task
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("search_result", [
+    {"availability": "available", "summary": "Release announced [1].",
+     "sources": [{"title": "Official", "url": "https://example.org/release",
+                  "source_name": "example.org"}]},
+    {"availability": "unavailable", "reason": "no_cited_results"},
+    {"availability": "unavailable", "reason": "provider_timeout"},
+])
+def test_search_continuation_blocks_repeat_and_reaches_spoken_answer(monkeypatch, search_result, caplog):
+    from magic_mirror.assistant.tools.search import WebSearch
+
+    requests = []
+
+    async def search(_self, arguments):
+        requests.append(arguments)
+        return search_result
+
+    monkeypatch.setattr(WebSearch, "search", search)
+
+    async def scenario():
+        store = AssistantStateStore()
+        store.on_state(WakeState.LISTENING)
+        voice, audio, client, _, _ = make_voice(tools_enabled=True, search_enabled=True,
+                                                openai_api_key="fixture-only-key")
+        voice.on_event = store.on_event
+        voice.on_playback = store.on_playback
+        voice.on_sources = store.on_sources
+        task = asyncio.create_task(voice.run())
+        try:
+            await wait_until(lambda: audio.capture.active)
+            client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user"))
+            client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="user"))
+            client.queue.put_nowait(event("response.created", response="search-1"))
+            client.queue.put_nowait(tool_done("search-1", tool_call(
+                "call-1", name="search_web", arguments='{"query":"latest Pi release"}')))
+            await wait_until(lambda: len(sent_outputs(client)) == 1)
+            assert len(requests) == 1
+            assert client.sent[-1] == {"type": "response.create",
+                                       "response": {"tool_choice": "none", "tools": []}}
+            if search_result["availability"] == "available":
+                assert store.snapshot().sources
+            else:
+                assert store.snapshot().sources == ()
+
+            # A misbehaving model may still ask again despite tool_choice=none.
+            client.queue.put_nowait(event("response.created", response="search-2"))
+            client.queue.put_nowait(tool_done("search-2", tool_call(
+                "call-2", name="search_web", arguments='{"query":"latest Pi release today"}')))
+            await wait_until(lambda: len(sent_outputs(client)) == 2)
+            assert len(requests) == 1
+            assert json.loads(sent_outputs(client)[1]["output"])["status"] == "tool_unavailable"
+            assert len([x for x in client.sent if x["type"] == "response.create"]) == 2
+            assert all(x["response"]["tool_choice"] == "none" for x in client.sent
+                       if x["type"] == "response.create")
+            if search_result["availability"] == "available":
+                assert store.snapshot().sources
+
+            client.queue.put_nowait(event("response.created", response="spoken"))
+            client.queue.put_nowait(event("response.output_audio.delta", response="spoken",
+                                          item="audio", audio=pcm_audio()))
+            client.queue.put_nowait(event("response.output_audio_transcript.done", response="spoken",
+                                          item="audio", role="assistant", text="Spoken answer.", final=True))
+            client.queue.put_nowait(event("response.done", response="spoken", status="completed"))
+            await wait_until(lambda: audio.playback.starts == 1 and voice.phase == VoicePhase.LISTENING)
+            assert store.snapshot().assistant_text == "Spoken answer."
+            assert bool(store.snapshot().sources) == (search_result["availability"] == "available")
+        finally:
+            voice.stop_event.set()
+            await asyncio.wait_for(task, 2)
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(asyncio.wait_for(scenario(), 5))
+    assert "search_already_attempted_this_turn" in caplog.text
+    assert "Search retrieval (status=" in caplog.text
+    assert "latest Pi release" not in caplog.text
+
+
+def test_identical_search_in_new_turn_uses_cache_without_provider_request(monkeypatch):
+    from magic_mirror.assistant.tools.search import DailyBudget, WebSearch
+    from test_search_tools import response
+
+    provider_calls = []
+    budget_reservations = []
+
+    async def fake_request(_self, payload):
+        provider_calls.append(payload)
+        return response()
+
+    def fake_reserve(_self, limit):
+        budget_reservations.append(limit)
+        return limit - len(budget_reservations)
+
+    monkeypatch.setattr(WebSearch, "_request", fake_request)
+    monkeypatch.setattr(DailyBudget, "reserve", fake_reserve)
+
+    async def scenario():
+        voice, audio, client, _, _ = make_voice(tools_enabled=True, search_enabled=True,
+                                                openai_api_key="fixture-only-key")
+        task = asyncio.create_task(voice.run())
+        try:
+            await wait_until(lambda: audio.capture.active)
+            for turn in (1, 2):
+                client.queue.put_nowait(event("input_audio_buffer.speech_started", item=f"u{turn}"))
+                client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item=f"u{turn}"))
+                client.queue.put_nowait(event("response.created", response=f"search-{turn}"))
+                client.queue.put_nowait(tool_done(f"search-{turn}", tool_call(
+                    f"call-{turn}", name="search_web",
+                    arguments='{"query":"latest Raspberry Pi OS release"}')))
+                await wait_until(lambda: len(sent_outputs(client)) == turn)
+                result = json.loads(sent_outputs(client)[-1]["output"])
+                assert result["status"] == "success"
+                assert result["data"]["availability"] == "available"
+                if turn == 2:
+                    assert result["data"]["cache"] == "hit"
+                client.queue.put_nowait(event("response.created", response=f"spoken-{turn}"))
+                client.queue.put_nowait(event("response.output_audio.delta", response=f"spoken-{turn}",
+                                              item=f"audio-{turn}", audio=pcm_audio()))
+                client.queue.put_nowait(event("response.done", response=f"spoken-{turn}", status="completed"))
+                await wait_until(lambda: audio.playback.starts == turn and voice.phase == VoicePhase.LISTENING)
+            assert len(provider_calls) == len(budget_reservations) == 1
+            assert len([x for x in client.sent if x["type"] == "response.create"]) == 2
+        finally:
+            voice.stop_event.set()
+            await asyncio.wait_for(task, 2)
+
+    asyncio.run(asyncio.wait_for(scenario(), 5))
+
+
+def test_search_tool_deadline_yields_one_tool_free_continuation(monkeypatch):
+    from magic_mirror.assistant.tools.search import WebSearch
+
+    async def stalled(_self, _arguments):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(WebSearch, "search", stalled)
+
+    async def scenario():
+        voice, audio, client, _, _ = make_voice(tools_enabled=True, search_enabled=True,
+                                                openai_api_key="fixture-only-key",
+                                                tool_timeout_seconds=0.02)
+        task = asyncio.create_task(voice.run())
+        try:
+            await wait_until(lambda: audio.capture.active)
+            client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user"))
+            client.queue.put_nowait(event("response.created", response="search"))
+            client.queue.put_nowait(tool_done("search", tool_call(
+                "call", name="search_web", arguments='{"query":"latest release"}')))
+            await wait_until(lambda: any(x["type"] == "response.create" for x in client.sent))
+            assert json.loads(sent_outputs(client)[0]["output"]) == {"status": "timeout"}
+            assert [x for x in client.sent if x["type"] == "response.create"] == [
+                {"type": "response.create", "response": {"tool_choice": "none", "tools": []}}]
+            assert voice.phase == VoicePhase.PROCESSING
+        finally:
+            voice.stop_event.set()
+            await asyncio.wait_for(task, 2)
+
+    asyncio.run(asyncio.wait_for(scenario(), 5))
+
+
+def test_search_continuation_disconnect_releases_audio_and_clears_sources(monkeypatch):
+    from magic_mirror.assistant.tools.search import WebSearch
+
+    async def search(_self, _arguments):
+        return {"availability": "available", "summary": "Cited [1].", "sources": [{
+            "title": "Official", "url": "https://example.org/official", "source_name": "example.org"}]}
+
+    monkeypatch.setattr(WebSearch, "search", search)
+
+    async def scenario():
+        store = AssistantStateStore()
+        store.on_state(WakeState.LISTENING)
+        voice, audio, client, _, _ = make_voice(tools_enabled=True, search_enabled=True,
+                                                openai_api_key="fixture-only-key")
+        voice.on_event = store.on_event
+        voice.on_sources = store.on_sources
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user"))
+        client.queue.put_nowait(event("response.created", response="search"))
+        client.queue.put_nowait(tool_done("search", tool_call(
+            "call", name="search_web", arguments='{"query":"latest release"}')))
+        await wait_until(lambda: bool(store.snapshot().sources) and
+                         any(x["type"] == "response.create" for x in client.sent))
+        client.queue.put_nowait(RealtimeError("Realtime connection closed unexpectedly",
+                                              category="abnormal_no_frame"))
+        with pytest.raises(RealtimeError, match="closed unexpectedly"):
+            await asyncio.wait_for(task, 2)
+        store.on_state(WakeState.ERROR)
+        assert audio.closed and client.closed and not audio.capture.active
+        assert store.snapshot().sources == () and not store.snapshot().assistant_text
+
+    asyncio.run(asyncio.wait_for(scenario(), 5))
 
 
 def test_search_never_runs_without_function_call_and_late_result_is_discarded(monkeypatch):
