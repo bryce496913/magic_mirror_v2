@@ -122,42 +122,54 @@ class ToolDispatcher:
     async def execute(self, name: str, arguments: str) -> ToolResult:
         spec = self.registry.get(name)
         if spec is None:
+            LOGGER.info("Tool validation rejected (unregistered_or_disabled)")
             return ToolResult(ToolStatus.TOOL_UNAVAILABLE)
         if not isinstance(arguments, str):
+            LOGGER.info("Tool %s validation rejected (invalid_arguments)", spec.name)
             return ToolResult(ToolStatus.INVALID_ARGUMENTS)
         try:
             input_size = len(arguments.encode("utf-8"))
         except UnicodeError:
+            LOGGER.info("Tool %s validation rejected (invalid_arguments)", spec.name)
             return ToolResult(ToolStatus.INVALID_ARGUMENTS)
         if input_size > spec.max_input_bytes:
+            LOGGER.info("Tool %s validation rejected (input_limit)", spec.name)
             return ToolResult(ToolStatus.INVALID_ARGUMENTS)
         try:
             value = json.loads(arguments, object_pairs_hook=_no_duplicate_keys,
                                parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Invalid JSON constant")))
         except (ValueError, UnicodeError, RecursionError):
+            LOGGER.info("Tool %s validation rejected (invalid_json)", spec.name)
             return ToolResult(ToolStatus.INVALID_ARGUMENTS)
         if not Draft202012Validator(spec.parameters).is_valid(value):
+            LOGGER.info("Tool %s validation rejected (schema)", spec.name)
             return ToolResult(ToolStatus.INVALID_ARGUMENTS)
+        LOGGER.info("Tool %s validation accepted", spec.name)
         try:
             async with asyncio.timeout(min(spec.timeout_seconds, self.settings.tool_timeout_seconds)):
                 async with self._slots:
+                    LOGGER.info("Tool %s execution started", spec.name)
                     output = await spec.executor(value)
             if not isinstance(output, dict):
                 raise TypeError("Tool executor must return an object")
             result = ToolResult(ToolStatus.SUCCESS, output)
             if len(result.json().encode("utf-8")) > min(spec.max_output_bytes, self.settings.tool_max_output_bytes):
+                LOGGER.info("Tool %s execution result (provider_failure)", spec.name)
                 return ToolResult(ToolStatus.PROVIDER_FAILURE)
-            LOGGER.info("Tool %s completed (success)", spec.name)
+            LOGGER.info("Tool %s execution result (success)", spec.name)
             return result
         except TimeoutError:
+            LOGGER.info("Tool %s execution result (timeout)", spec.name)
             return ToolResult(ToolStatus.TIMEOUT)
         except ToolCancelled:
+            LOGGER.info("Tool %s execution result (cancelled)", spec.name)
             return ToolResult(ToolStatus.CANCELLED)
         except asyncio.CancelledError:
+            LOGGER.info("Tool %s execution result (cancelled)", spec.name)
             raise
         except Exception as exc:
             # Only the allowlisted name and exception type are logged; never arguments or result data.
-            LOGGER.error("Tool %s failed (%s)", spec.name, type(exc).__name__)
+            LOGGER.error("Tool %s execution result (provider_failure: %s)", spec.name, type(exc).__name__)
             return ToolResult(ToolStatus.PROVIDER_FAILURE)
 
 

@@ -11,12 +11,13 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .events import ConversationEvent, PlaybackAction, PlaybackEvent
+from .events import AudioTranscript, ConversationEvent, PlaybackAction, PlaybackEvent
 from .wake import WakeState
 from .tools.search import _public_url
 
 SOCKET_PATH = Path(__file__).resolve().parents[2] / ".private" / "assistant-state.sock"
 MAX_TEXT = 240
+MAX_SNAPSHOT_BYTES = 8192
 CLIENT_IO_TIMEOUT = 0.5
 CLIENT_DISCONNECT_ERRNOS = {errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED, errno.ENOTCONN}
 
@@ -51,13 +52,17 @@ class AssistantStateStore:
         self.assistant_item = None
         self.response_id = None
         self.playback_active = False
+        self._audio_played = False
+        self._playback_finished = False
+        self._final_from_response_done = False
         self.error = ""
         self.sources: tuple[dict[str, str], ...] = ()
         self._retired_user_items = deque(maxlen=16)
 
     def snapshot(self) -> AssistantSnapshot:
         return AssistantSnapshot(self.state.value, self.user_text, self.user_final,
-                                 self.assistant_text, self.assistant_final,
+                                 self.assistant_text if self._audio_played else "",
+                                 self.assistant_final if self._audio_played else False,
                                  self.playback_active, self.error,
                                  tuple(dict(source) for source in self.sources))
 
@@ -67,6 +72,9 @@ class AssistantStateStore:
         self.user_item = self.assistant_item = self.response_id = None
         self.playback_active = False
         self.sources = ()
+        self._audio_played = False
+        self._playback_finished = False
+        self._final_from_response_done = False
 
     def on_sources(self, sources: tuple[dict[str, str], ...]) -> None:
         """Publish cited links for this exchange only; no raw search text is stored."""
@@ -103,12 +111,31 @@ class AssistantStateStore:
             self.assistant_text = ""
             self.assistant_final = False
             self.assistant_item = None
+            self._audio_played = False
+            self._playback_finished = False
+            self._final_from_response_done = False
         elif event.kind == "response.done" and event.response_id == self.response_id:
             if event.status != "completed":
                 self.assistant_text = ""
                 self.assistant_final = False
                 self.playback_active = False
                 self.sources = ()
+                self.response_id = None
+                self._audio_played = False
+                self._playback_finished = True
+            elif not self._playback_finished or self._audio_played:
+                # response.done carries the completed audio transcript even if
+                # separate streaming transcript events were absent or late.
+                for transcript in event.audio_transcripts:
+                    if (isinstance(transcript, AudioTranscript) and
+                            isinstance(transcript.item_id, str) and transcript.item_id and
+                            isinstance(transcript.text, str) and transcript.text and
+                            (self.assistant_item is None or self.assistant_item == transcript.item_id)):
+                        self.assistant_item = transcript.item_id
+                        self.assistant_text = transcript.text[:MAX_TEXT]
+                        self.assistant_final = True
+                        self._final_from_response_done = True
+                        break
         if event.text is None or not event.item_id or event.role not in {"user", "assistant"}:
             return
         if event.role == "assistant" and not event.kind.startswith("response.output_audio_transcript."):
@@ -122,6 +149,8 @@ class AssistantStateStore:
             self.user_text = (event.text if event.final else self.user_text + event.text)[:MAX_TEXT]
             self.user_final = event.final
         elif event.response_id == self.response_id:
+            if (self._playback_finished and not self._audio_played) or self._final_from_response_done:
+                return
             if self.assistant_item and self.assistant_item != event.item_id:
                 return
             self.assistant_item = event.item_id
@@ -132,19 +161,24 @@ class AssistantStateStore:
         if event.response_id != self.response_id:
             return
         if event.action == PlaybackAction.STARTED:
+            self._audio_played = True
             self.playback_active = True
         elif event.action == PlaybackAction.COMPLETED:
-            if not self.playback_active:
+            if not self._audio_played:
                 # A transcript without a successful local audio write was not spoken.
                 self.assistant_text = ""
                 self.assistant_final = False
+                self.sources = ()
             self.playback_active = False
+            self._playback_finished = True
         elif event.action == PlaybackAction.INTERRUPTED:
             self.playback_active = False
             self.assistant_text = ""
             self.assistant_final = False
             self.response_id = None
             self.sources = ()
+            self._audio_played = False
+            self._playback_finished = True
 
 
 def acquire_owner_lock(path: Path = SOCKET_PATH) -> int:
@@ -195,7 +229,10 @@ class AssistantStateServer:
     async def _handle(self, _reader, writer) -> None:
         try:
             try:
-                writer.write((json.dumps(asdict(self.store.snapshot())) + "\n").encode())
+                raw = (json.dumps(asdict(self.store.snapshot())) + "\n").encode()
+                if len(raw) > MAX_SNAPSHOT_BYTES:
+                    raw = b'{"state":"error","error":"Assistant display unavailable"}\n'
+                writer.write(raw)
                 await asyncio.wait_for(writer.drain(), CLIENT_IO_TIMEOUT)
             except TimeoutError:
                 writer.transport.abort()  # a stalled local reader must not hold a handler open
@@ -235,12 +272,12 @@ def read_snapshot(path: Path = SOCKET_PATH) -> dict:
         client.settimeout(0.25)
         client.connect(str(path))
         raw = bytearray()
-        while b"\n" not in raw and len(raw) <= 2048:
-            chunk = client.recv(2048 - len(raw) + 1)
+        while b"\n" not in raw and len(raw) <= MAX_SNAPSHOT_BYTES:
+            chunk = client.recv(MAX_SNAPSHOT_BYTES - len(raw) + 1)
             if not chunk:
                 break
             raw.extend(chunk)
-        if len(raw) > 2048 or b"\n" not in raw:
+        if len(raw) > MAX_SNAPSHOT_BYTES or b"\n" not in raw:
             raise ValueError("Invalid assistant snapshot length")
     value = json.loads(raw)
     if not isinstance(value, dict) or value.get("state") not in {state.value for state in WakeState}:

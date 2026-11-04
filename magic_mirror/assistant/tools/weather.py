@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 
 from ...config import Settings
-from ...providers.weather import API_URL as FORECAST_URL, DESCRIPTIONS
+from ...providers.weather import API_URL as FORECAST_URL, DESCRIPTIONS, dual_temperature
 
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 MAX_BODY = 256 * 1024
@@ -111,9 +111,20 @@ def _condition(value: Any) -> str | None:
     return DESCRIPTIONS.get(int(code), (None, ""))[0] if code is not None else None
 
 
+def _valid_temperature(value: Any, unit: str) -> bool:
+    return (not isinstance(value, bool) and isinstance(value, (int, float)) and
+            math.isfinite(value) and -100 <= value <= (70 if unit == "celsius" else 160))
+
+
 def _temperature(value: Any, unit: str) -> dict[str, Any] | None:
-    number = _number(value, low=-100, high=70 if unit == "celsius" else 160)
-    return {"value": number, "unit": "°F" if unit == "fahrenheit" else "°C"} if number is not None else None
+    if not _valid_temperature(value, unit):
+        return None
+    celsius, fahrenheit = dual_temperature(value, unit)
+    # Keep the original source-unit fields for existing tool consumers. The
+    # paired fields are derived once from the same response, Fahrenheit first.
+    return {"fahrenheit": fahrenheit, "celsius": celsius,
+            "value": fahrenheit if unit == "fahrenheit" else celsius,
+            "unit": "°F" if unit == "fahrenheit" else "°C"}
 
 
 def _probability(value: Any) -> float | None:
@@ -342,10 +353,11 @@ class WeatherTools:
                     relevant.append((i, moment))
         if period in ("afternoon", "tonight", "today") and relevant:
             probs = [_probability(_array_at(hourly, "precipitation_probability", i)) for i, _ in relevant]
-            temps = [_number(_array_at(hourly, "temperature_2m", i), low=-100, high=160) for i, _ in relevant]
+            temps = [_array_at(hourly, "temperature_2m", i) for i, _ in relevant]
             base["window"] = {"from": relevant[0][1].isoformat(), "until": relevant[-1][1].isoformat(),
                               "max_precipitation_probability_percent": max((x for x in probs if x is not None), default=None),
-                              "min_temperature": _temperature(min((x for x in temps if x is not None), default=None), self.settings.weather_unit)}
+                              "min_temperature": _temperature(min((x for x in temps if _valid_temperature(x, self.settings.weather_unit)),
+                                                                  default=None), self.settings.weather_unit)}
         base.update({"period": period, "days": periods[:7]})
         if not periods and "window" not in base:
             return {"availability": "unavailable", "reason": "forecast_period_missing",

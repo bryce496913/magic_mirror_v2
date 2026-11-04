@@ -9,9 +9,9 @@ import pytest
 
 from magic_mirror.assistant.tools.weather import (
     FORECAST_URL, GEOCODE_URL, WeatherRateLimited, WeatherTools, WeatherUnavailable,
-    _fetch_json,
+    _fetch_json, _temperature,
 )
-from magic_mirror.assistant.tools.registry import default_registry
+from magic_mirror.assistant.tools.registry import ToolDispatcher, ToolStatus, default_registry
 from magic_mirror.config import Settings
 
 
@@ -81,8 +81,10 @@ def test_current_conditions_default_location_and_units():
     assert result["kind"] == "current_model_estimate"
     assert (result["location"], result["timezone"], result["provider"]) == (
         "New York", "America/New_York", "Open-Meteo")
-    assert result["temperature"] == {"value": 12.0, "unit": "°C"}
-    assert result["feels_like"] == {"value": 10.0, "unit": "°C"}
+    assert result["temperature"] == {"fahrenheit": 53.6, "celsius": 12.0,
+                                     "value": 12.0, "unit": "°C"}
+    assert result["feels_like"] == {"fahrenheit": 50.0, "celsius": 10.0,
+                                    "value": 10.0, "unit": "°C"}
     assert result["humidity_percent"] == 65
     assert result["wind_speed"] == 12
     assert result["wind_direction_degrees"] == 225
@@ -91,23 +93,51 @@ def test_current_conditions_default_location_and_units():
 
     fahrenheit, calls_f, _, _ = service(unit="fahrenheit")
     result_f = run(fahrenheit.current({}))
-    assert result_f["temperature"] == {"value": 12.0, "unit": "°F"}
+    assert result_f["temperature"] == {"fahrenheit": 12.0, "celsius": -11.1,
+                                       "value": 12.0, "unit": "°F"}
+    assert result_f["feels_like"] == {"fahrenheit": 10.0, "celsius": -12.2,
+                                      "value": 10.0, "unit": "°F"}
     assert result_f["wind_unit"] == "mph"
+    assert len(calls_f) == 1
     assert calls_f[0][1]["temperature_unit"] == "fahrenheit"
 
 
-@pytest.mark.parametrize("period,expected", [
-    ("today", ["2026-11-02"]), ("tomorrow", ["2026-11-03"]),
-    ("weekend", ["2026-11-07", "2026-11-08"]),
+@pytest.mark.parametrize("value,unit,expected_f,expected_c", [
+    (20, "celsius", 68.0, 20.0),
+    (11.1, "celsius", 52.0, 11.1),
+    (0, "celsius", 32.0, 0.0),
+    (-40, "celsius", -40.0, -40.0),
+    (68, "fahrenheit", 68.0, 20.0),
+    (32, "fahrenheit", 32.0, 0.0),
+    (-4, "fahrenheit", -4.0, -20.0),
 ])
-def test_daily_forecast_periods(period, expected):
+def test_temperature_conversion_uses_source_unit_once(value, unit, expected_f, expected_c):
+    paired = _temperature(value, unit)
+    assert paired["fahrenheit"] == expected_f
+    assert paired["celsius"] == expected_c
+    assert paired["value"] == (expected_f if unit == "fahrenheit" else expected_c)
+    assert list(paired)[:2] == ["fahrenheit", "celsius"]
+
+
+@pytest.mark.parametrize("value", [None, True, float("nan"), float("inf")])
+def test_missing_or_invalid_temperature_never_gains_a_conversion(value):
+    assert _temperature(value, "celsius") is None
+
+
+@pytest.mark.parametrize("period,expected,low_f,low_c,high_f", [
+    ("today", ["2026-11-02"], 35.6, 2, 59.0),
+    ("tomorrow", ["2026-11-03"], 37.4, 3, 60.8),
+    ("weekend", ["2026-11-07", "2026-11-08"], 46.4, 8, 68.0),
+])
+def test_daily_forecast_periods(period, expected, low_f, low_c, high_f):
     weather, _, _, _ = service()
     result = run(weather.forecast({"period": period}))
     assert result["kind"] == "forecast"
     assert [day["date"] for day in result["days"]] == expected
     assert result["days"][-1]["precipitation_probability_percent"] == (20 if period == "today" else 80)
-    assert result["days"][-1]["low"] == {"value": 2 + (6 if period == "weekend" else
-                                                             1 if period == "tomorrow" else 0), "unit": "°C"}
+    assert result["days"][-1]["low"] == {"fahrenheit": low_f, "celsius": low_c,
+                                          "value": low_c, "unit": "°C"}
+    assert result["days"][0]["high"]["fahrenheit"] == high_f
 
 
 def test_hourly_afternoon_rain_and_tonight_low():
@@ -116,8 +146,23 @@ def test_hourly_afternoon_rain_and_tonight_low():
     tonight = run(weather.forecast({"period": "tonight"}))
     assert afternoon["days"] == [] and afternoon["window"]["max_precipitation_probability_percent"] == 70
     assert afternoon["window"]["from"].startswith("2026-11-02T12:00")
-    assert tonight["days"] == [] and tonight["window"]["min_temperature"] == {"value": 8.0, "unit": "°C"}
+    assert tonight["days"] == [] and tonight["window"]["min_temperature"] == {
+        "fahrenheit": 46.4, "celsius": 8.0, "value": 8.0, "unit": "°C"}
     assert tonight["window"]["until"].startswith("2026-11-03T05:00")
+
+
+def test_fahrenheit_source_pairs_forecast_high_low_and_hourly_minimum():
+    weather, calls, _, _ = service(unit="fahrenheit")
+    tomorrow = run(weather.forecast({"period": "tomorrow"}))
+    day = tomorrow["days"][0]
+    assert day["high"] == {"fahrenheit": 16.0, "celsius": -8.9,
+                           "value": 16.0, "unit": "°F"}
+    assert day["low"] == {"fahrenheit": 3.0, "celsius": -16.1,
+                          "value": 3.0, "unit": "°F"}
+    tonight = run(weather.forecast({"period": "tonight"}))
+    assert tonight["window"]["min_temperature"] == {
+        "fahrenheit": 8.0, "celsius": -13.3, "value": 8.0, "unit": "°F"}
+    assert len(calls) == 1  # forecast windows share the same cached source response
 
 
 def test_overseas_location_and_ambiguous_location():
@@ -125,6 +170,8 @@ def test_overseas_location_and_ambiguous_location():
     result = run(weather.forecast({"location": "Auckland", "period": "tomorrow"}))
     assert result["location"] == "Auckland, Auckland, New Zealand"
     assert result["timezone"] == "Pacific/Auckland"
+    assert result["days"][0]["high"]["fahrenheit"] == 60.8
+    assert result["days"][0]["high"]["celsius"] == 16.0
     assert len(calls) == 2
     assert calls[0][1]["name"] == "Auckland"
     assert calls[1][1]["latitude"] == -36.85
@@ -167,9 +214,30 @@ def test_missing_forecast_fields_and_current_fields_are_not_invented():
     result = run(weather.forecast({"period": "tomorrow"}))
     assert result["days"][0]["low"] is None
     assert run(weather.current({}))["humidity_percent"] is None
+    payload["current"]["temperature_2m"] = None
+    payload["current"]["apparent_temperature"] = None
+    current = run(weather.current({}))
+    assert current["temperature"] is None and current["feels_like"] is None
     payload["daily"].pop("time")
     weather._cache.clear()
     assert run(weather.forecast({"period": "tomorrow"}))["reason"] == "forecast_data_missing"
+
+
+@pytest.mark.parametrize("unit", ["celsius", "fahrenheit"])
+def test_seven_day_paired_temperatures_fit_tool_output_limit(unit):
+    weather, calls, _, _ = service(unit=unit)
+    registry = default_registry(weather.settings)
+    spec = registry.get("get_weather_forecast")
+    registered_weather = spec.executor.__self__
+    registered_weather.fetch_json = weather.fetch_json
+    result = run(ToolDispatcher(registry, weather.settings).execute(
+        "get_weather_forecast", '{"period":"next_7_days"}'))
+    assert result.status == ToolStatus.SUCCESS
+    assert len(result.json().encode("utf-8")) <= spec.max_output_bytes
+    assert len(result.data["days"]) == 7
+    assert all(set(day["high"]) >= {"fahrenheit", "celsius"} and
+               set(day["low"]) >= {"fahrenheit", "celsius"} for day in result.data["days"])
+    assert len(calls) == 1 and calls[0][0] == FORECAST_URL
 
 
 def test_cache_reuse_failure_stale_and_expiration():
