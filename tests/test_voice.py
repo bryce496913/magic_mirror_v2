@@ -546,19 +546,20 @@ def test_manual_reply_cancel_and_no_duplicate_speaker():
     asyncio.run(scenario())
 
 
-def test_cancel_with_queued_output_never_relabels_stale_chunks():
+def test_cancel_during_full_output_queue_never_relabels_stale_chunks():
     async def scenario():
         voice, audio, client, _, _ = make_voice()
         await voice.handle_event(event("response.created", response="r"))
-        await voice.handle_event(event(
-            "response.output_audio.delta", response="r", item="i", audio=pcm_audio(count=24000)))
-        assert voice._output.qsize() == 10
+        incoming = asyncio.create_task(voice.handle_event(event(
+            "response.output_audio.delta", response="r", item="i", audio=pcm_audio(count=24000))))
+        await wait_until(lambda: voice._output.qsize() == 8)
         async def acknowledge_clear():
             await wait_until(lambda: any(x["type"] == "input_audio_buffer.clear" for x in client.sent))
             await voice.handle_event(event("input_audio_buffer.cleared"))
         acknowledgment = asyncio.create_task(acknowledge_clear())
         await voice.cancel_reply()
         await acknowledgment
+        await asyncio.wait_for(incoming, 1)
         assert all(entry[0] != voice._generation for entry in list(voice._output._queue))
         assert audio.playback.starts == 0
         await voice.close()
