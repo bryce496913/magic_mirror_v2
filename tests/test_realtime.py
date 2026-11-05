@@ -292,7 +292,7 @@ def test_expiry_idle_response_and_session_limits():
     run(scenario())
 
 
-def test_idle_watchdog_closes_without_receive():
+def test_idle_watchdog_closes_without_receive(caplog):
     async def scenario():
         now = [0.0]
         socket = FakeSocket(CREATED, UPDATED)
@@ -309,6 +309,29 @@ def test_idle_watchdog_closes_without_receive():
         with pytest.raises(RealtimeError, match="idle timeout"):
             await client.receive()
     run(scenario())
+    assert "Realtime watchdog timeout (category=idle_timeout)" in caplog.text
+
+
+def test_response_watchdog_reports_safe_category(caplog):
+    async def scenario():
+        now = [0.0]
+        socket = FakeSocket(CREATED, UPDATED)
+        client, _ = client_with(socket, realtime_max_session_seconds=10,
+                               realtime_idle_seconds=10, realtime_max_response_seconds=2)
+        client.clock = lambda: now[0]
+        await client.connect()
+        client.tracker.response_started["response"] = 0.0
+        watchdog = client._watchdog
+        await asyncio.sleep(0)
+        now[0] = 2.0
+        client._activity.set()
+        await asyncio.wait_for(watchdog, 1)
+        assert socket.closed
+        with pytest.raises(RealtimeError, match="Response duration limit"):
+            await client.receive()
+
+    run(scenario())
+    assert "Realtime watchdog timeout (category=response_limit)" in caplog.text
 
 
 def test_watchdog_cancellation_after_immediate_send_does_not_hang_close():
@@ -410,6 +433,7 @@ def test_pending_receive_uses_extended_deadline_after_tool_continuation():
     (ConnectionClosedError(Close(1011, "private-reason"), Close(1011, "private-reason"), True),
      "remote_error", 1011),
     (ConnectionClosedError(None, None), "abnormal_no_frame", None),
+    (ConnectionClosedError(None, Close(1011, "keepalive ping timeout")), "keepalive_timeout", None),
 ])
 def test_close_diagnostics_are_bounded_and_do_not_include_provider_reason(closed, category, code):
     async def scenario():
