@@ -31,6 +31,11 @@ def _close_diagnostics(exc: ConnectionClosed) -> tuple[str, int | None]:
     """Use only the close-frame category and numeric code, never its reason text."""
     frame = exc.rcvd
     if frame is None:
+        # websockets 15 emits this exact local close when its Ping receives no
+        # Pong before ping_timeout. Do not expose the close reason in logs.
+        if (exc.sent is not None and exc.sent.code == 1011 and
+                exc.sent.reason == "keepalive ping timeout"):
+            return "keepalive_timeout", None
         return "abnormal_no_frame", None
     code = frame.code if isinstance(frame.code, int) and 1000 <= frame.code <= 4999 else None
     return ("remote_clean" if isinstance(exc, ConnectionClosedOK) else "remote_error"), code

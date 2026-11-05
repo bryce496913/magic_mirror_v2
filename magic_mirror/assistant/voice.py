@@ -25,6 +25,7 @@ SILENCE_SECONDS = 60
 MAX_TOOL_ARGUMENT_BYTES = 4096
 TOOL_AUDIO_DRAIN = object()
 CONTINUATION_AUDIO_START_SECONDS = 30
+MAX_OUTPUT_BUFFER_SECONDS = 90
 LOGGER = logging.getLogger(__name__)
 TRANSPORT_REASONS = {
     "Session duration limit reached": "session_limit",
@@ -115,10 +116,17 @@ class VoiceConversation:
         self._continuation_audio_seen = False
         self._continuation_text_seen = False
         self._continuation_audio_deadline: float | None = None
+        self._audio_event_count = 0
+        self._audio_received_samples = 0
+        self._output_queue_peak = 0
         self.clock = clock
         self.transcripts: dict[tuple[str, str, int], Transcript] = {}
         self.stop_event = asyncio.Event()
-        self._output = asyncio.Queue(maxsize=8)
+        # Realtime can deliver speech faster than the physical speaker consumes it.
+        # Hold at most one response's bounded PCM, rather than blocking WebSocket
+        # reads after the former eight (0.8-second) chunks filled.
+        output_seconds = min(MAX_OUTPUT_BUFFER_SECONDS, settings.realtime_max_response_seconds)
+        self._output = asyncio.Queue(maxsize=output_seconds * 1000 // CHUNK_MS + 2)
         self._playback_lock = asyncio.Lock()
         self._capture_read_lock = asyncio.Lock()
         self._input_lock = asyncio.Lock()
@@ -242,7 +250,7 @@ class VoiceConversation:
         except RealtimeError as exc:
             if not (self.stop_event.is_set() and exc.category == "local_shutdown"):
                 category = exc.category if exc.category in {
-                    "remote_clean", "remote_error", "abnormal_no_frame", "socket_error",
+                    "remote_clean", "remote_error", "abnormal_no_frame", "keepalive_timeout", "socket_error",
                     "protocol_error", "local_timeout", "local_shutdown",
                 } else "unknown"
                 code = (exc.close_code if isinstance(exc.close_code, int) and
@@ -251,8 +259,10 @@ class VoiceConversation:
                                 "awaiting_audio" if self._continuation_audio_deadline is not None else
                                 "audio_started" if self._continuation_started and self._continuation_audio_seen else
                                 "none")
-                LOGGER.warning("Realtime transport error (reason=%s); close_category=%s close_code=%s continuation=%s; voice session recovering",
-                               TRANSPORT_REASONS.get(str(exc), "unknown"), category, code, continuation)
+                LOGGER.warning("Realtime transport error (reason=%s); close_category=%s close_code=%s continuation=%s audio_events=%d audio_ms=%d queue_peak=%d; voice session recovering",
+                               TRANSPORT_REASONS.get(str(exc), "unknown"), category, code, continuation,
+                               self._audio_event_count, self._audio_received_samples * 1000 // API_RATE,
+                               self._output_queue_peak)
             raise
         finally:
             await self.close()
@@ -295,6 +305,8 @@ class VoiceConversation:
             if event.kind == "response.created" and self._awaiting_tool_response:
                 LOGGER.info("Response continuation started")
             await self.handle_event(event)
+            if event.kind == "response.output_audio.delta":
+                await asyncio.sleep(0)  # service keepalive and speaker tasks during bursts
 
     async def _silence_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -727,6 +739,9 @@ class VoiceConversation:
                     raise VoiceError("Unexpected response without a new user turn")
                 await self._mute_input(VoicePhase.RESPONDING)
                 self._current_response = event.response_id
+                self._audio_event_count = 0
+                self._audio_received_samples = 0
+                self._output_queue_peak = 0
                 self._first_audio_reported = False
                 self._output_rate = StreamingPCM(API_RATE, self.settings.audio_playback_rate)
                 self._limiter = StreamingPeakLimiter(self.settings.audio_playback_gain,
@@ -755,6 +770,8 @@ class VoiceConversation:
             if self._audio_item and self._audio_item != event.item_id:
                 raise VoiceError("Multiple audio items in one response are unsupported")
             self._audio_item = event.item_id
+            self._audio_event_count += 1
+            self._audio_received_samples += len(raw) // 2
             self._audio_content_index = event.content_index or 0
             if not self._first_audio_reported and self._speech_end is not None:
                 if self.on_latency:
@@ -766,9 +783,18 @@ class VoiceConversation:
                     return
                 samples = np.frombuffer(raw[offset:offset + API_RATE // 10 * 2], dtype="<i2")
                 chunk = self._limiter.process(self._output_rate.convert(samples)).reshape(-1, 1)
-                await self._output.put((generation, event.response_id, chunk))
+                if self._output.qsize() >= self._output.maxsize - 2:
+                    LOGGER.warning("Realtime audio playback buffer exceeded (capacity_seconds=%d)",
+                                   min(MAX_OUTPUT_BUFFER_SECONDS, self.settings.realtime_max_response_seconds))
+                    raise VoiceError("OpenAI audio exceeded the bounded speaker buffer")
+                self._output.put_nowait((generation, event.response_id, chunk))
+                self._output_queue_peak = max(self._output_queue_peak, self._output.qsize())
         elif kind == "response.done" and event.response_id == self._current_response:
             self._finished_responses.add(event.response_id)
+            LOGGER.info("Realtime audio received (events=%d, duration_ms=%d, queue_peak=%d, status=%s)",
+                        self._audio_event_count, self._audio_received_samples * 1000 // API_RATE,
+                        self._output_queue_peak,
+                        event.status if event.status in {"completed", "cancelled", "failed", "incomplete"} else "unknown")
             if self.settings.tools_enabled:
                 status = event.status if event.status in {"completed", "cancelled", "failed", "incomplete"} else "unknown"
                 LOGGER.info("Realtime response completed (status=%s, function_calls=%d)",

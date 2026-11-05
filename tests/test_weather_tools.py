@@ -230,6 +230,7 @@ def test_seven_day_paired_temperatures_fit_tool_output_limit(unit):
     spec = registry.get("get_weather_forecast")
     registered_weather = spec.executor.__self__
     registered_weather.fetch_json = weather.fetch_json
+    registered_weather.now = weather.now
     result = run(ToolDispatcher(registry, weather.settings).execute(
         "get_weather_forecast", '{"period":"next_7_days"}'))
     assert result.status == ToolStatus.SUCCESS

@@ -433,6 +433,7 @@ def test_pending_receive_uses_extended_deadline_after_tool_continuation():
     (ConnectionClosedError(Close(1011, "private-reason"), Close(1011, "private-reason"), True),
      "remote_error", 1011),
     (ConnectionClosedError(None, None), "abnormal_no_frame", None),
+    (ConnectionClosedError(None, Close(1011, "keepalive ping timeout")), "keepalive_timeout", None),
 ])
 def test_close_diagnostics_are_bounded_and_do_not_include_provider_reason(closed, category, code):
     async def scenario():
