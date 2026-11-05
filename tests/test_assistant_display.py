@@ -240,33 +240,6 @@ def test_private_socket_snapshot_refresh_single_owner_and_restart(tmp_path):
     asyncio.run(scenario())
 
 
-def test_cited_sources_are_loopback_snapshot_only_and_clear_with_exchange():
-    from magic_mirror.assistant.display import AssistantStateStore
-    from magic_mirror.assistant.wake import WakeState
-
-    store = AssistantStateStore()
-    store.on_state(WakeState.LISTENING)
-    store.on_event(event("input_audio_buffer.speech_started", item="question"))
-    store.on_sources(({"title": "Official release", "url": "https://example.org/release"},
-                      {"title": "Private", "url": "http://127.0.0.1/admin"}))
-    assert store.snapshot().sources == ({"title": "Official release", "url": "https://example.org/release"},)
-    store.on_event(event("response.created", response="spoken"))
-    store.on_event(event("response.output_audio_transcript.done", response="spoken",
-                         item="audio", role="assistant", text="A cited update.", final=True))
-    assert store.snapshot().assistant_text == ""  # spoken text waits for actual playback
-    store.on_playback(PlaybackEvent(PlaybackAction.STARTED, "spoken"))
-    assert store.snapshot().sources and store.snapshot().assistant_text == "A cited update."
-    store.on_playback(PlaybackEvent(PlaybackAction.INTERRUPTED, "spoken"))
-    assert store.snapshot().sources == () and store.snapshot().assistant_text == ""
-    store.on_event(event("response.created", response="unplayed"))
-    store.on_sources(({"title": "Pending", "url": "https://example.org/pending"},))
-    store.on_playback(PlaybackEvent(PlaybackAction.COMPLETED, "unplayed"))
-    assert store.snapshot().sources == () and store.snapshot().assistant_text == ""
-    store.on_sources(({"title": "Another", "url": "https://example.org/another"},))
-    store.on_state(WakeState.IDLE)
-    assert store.snapshot().sources == ()
-
-
 @pytest.mark.parametrize("stage,error", [
     ("write", BrokenPipeError(errno.EPIPE, "Broken pipe")),
     ("drain", ConnectionResetError("Connection lost")),

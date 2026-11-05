@@ -157,8 +157,7 @@ class WakeController:
                  on_state: Callable[[WakeState], None] | None = None,
                  on_metrics: Callable[[WakeMetrics], None] | None = None,
                  on_voice_event: Callable[[ConversationEvent], None] | None = None,
-                 on_playback: Callable[[PlaybackEvent], None] | None = None,
-                 on_sources: Callable[[tuple[dict[str, str], ...]], None] | None = None):
+                 on_playback: Callable[[PlaybackEvent], None] | None = None):
         self.settings = settings
         self.audio = audio or AudioManager(settings, enabled=True)
         self.detector_factory = detector_factory
@@ -170,7 +169,6 @@ class WakeController:
         self.on_metrics = on_metrics
         self.on_voice_event = on_voice_event
         self.on_playback = on_playback
-        self.on_sources = on_sources
         self.state = WakeState.STOPPED
         self.stop_event = asyncio.Event()
         self.detector = None
@@ -270,7 +268,7 @@ class WakeController:
                 self.settings, audio=self.audio, before_capture=handoff,
                 first_speech_seconds=self.settings.wake_first_speech_seconds,
                 on_event=self._voice_event, on_ready=lambda: self._state(WakeState.LISTENING),
-                on_playback=self._playback_event, on_sources=self.on_sources,
+                on_playback=self._playback_event,
             )
         except Exception:
             drain_stop.set()

@@ -49,27 +49,6 @@ def test_voice_weather_configuration():
             Settings.from_env(values)
 
 
-def test_search_is_opt_in_with_bounded_cost_configuration():
-    default = Settings.from_env({})
-    assert not default.search_enabled
-    assert default.search_daily_budget == 10
-    configured = Settings.from_env({"MIRROR_SEARCH_ENABLED": "true",
-        "MIRROR_SEARCH_MAX_PER_CONVERSATION": "3", "MIRROR_SEARCH_MAX_RESULTS": "2",
-        "MIRROR_SEARCH_TIMEOUT_SECONDS": "9", "MIRROR_SEARCH_CACHE_SECONDS": "120",
-        "MIRROR_SEARCH_DAILY_BUDGET": "5"})
-    assert configured.search_enabled and configured.search_max_per_conversation == 3
-    assert configured.search_max_results == 2 and configured.search_timeout_seconds == 9
-    assert configured.search_cache_seconds == 120 and configured.search_daily_budget == 5
-    for values in ({"MIRROR_SEARCH_ENABLED": "yes"},
-                   {"MIRROR_SEARCH_MAX_PER_CONVERSATION": "0"},
-                   {"MIRROR_SEARCH_MAX_RESULTS": "4"},
-                   {"MIRROR_SEARCH_TIMEOUT_SECONDS": "0"},
-                   {"MIRROR_SEARCH_CACHE_SECONDS": "-1"},
-                   {"MIRROR_SEARCH_DAILY_BUDGET": "1001"}):
-        with pytest.raises(ConfigurationError):
-            Settings.from_env(values)
-
-
 def test_pihole_ca_certificate_path(tmp_path):
     ca_cert = tmp_path / "local-ca.crt"
     ca_cert.write_text("test fixture only")

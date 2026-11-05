@@ -101,8 +101,7 @@ class FakeProcess:
 
 class FakeVoice:
     def __init__(self, settings, *, audio, before_capture, first_speech_seconds,
-                 on_event, on_ready, on_playback=None, on_sources=None,
-                 gate=None, failure=None, heard_speech=True):
+                 on_event, on_ready, on_playback=None, gate=None, failure=None, heard_speech=True):
         self.audio = audio
         self.before_capture = before_capture
         self.on_event = on_event

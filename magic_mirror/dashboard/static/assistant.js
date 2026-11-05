@@ -27,24 +27,6 @@
       "Say the configured wake phrase to begin." : "";
     transcript("user", snapshot.user_text, snapshot.user_final);
     transcript("assistant", snapshot.assistant_text, snapshot.assistant_final);
-    const sources = region.querySelector('[data-role="assistant-sources"]');
-    sources.replaceChildren();
-    if (snapshot.assistant_text && Array.isArray(snapshot.sources)) {
-      snapshot.sources.slice(0, 3).forEach(function (source) {
-        if (!source || typeof source.url !== "string" || typeof source.title !== "string") return;
-        try {
-          const url = new URL(source.url);
-          if (url.protocol !== "https:" && url.protocol !== "http:") return;
-          const link = document.createElement("a");
-          link.href = url.href;
-          link.textContent = source.title;
-          link.target = "_blank";
-          link.rel = "noopener noreferrer";
-          sources.append(link);
-        } catch (_error) { /* Ignore malformed citation links. */ }
-      });
-    }
-    sources.hidden = !sources.childElementCount;
   }
 
   async function refresh() {

@@ -129,12 +129,6 @@ class Settings:
     tool_concurrency: int = 2
     tool_max_output_bytes: int = 2048
     tool_max_calls: int = 4
-    search_enabled: bool = False
-    search_max_per_conversation: int = 2
-    search_max_results: int = 3
-    search_timeout_seconds: float = 12.0
-    search_cache_seconds: int = 300
-    search_daily_budget: int = 10
     wake_enabled: bool = False
     wake_phrase: str = "magic mirror"
     wake_model_dir: str = ""
@@ -304,13 +298,6 @@ class Settings:
                    tool_concurrency=_audio_int(values, "MIRROR_TOOL_CONCURRENCY", 2, 1, 4),
                    tool_max_output_bytes=_audio_int(values, "MIRROR_TOOL_MAX_OUTPUT_BYTES", 2048, 64, 8192),
                    tool_max_calls=_audio_int(values, "MIRROR_TOOL_MAX_CALLS", 4, 1, 8),
-                   search_enabled=_bool(values, "MIRROR_SEARCH_ENABLED", False),
-                   search_max_per_conversation=_audio_int(
-                       values, "MIRROR_SEARCH_MAX_PER_CONVERSATION", 2, 1, 4),
-                   search_max_results=_audio_int(values, "MIRROR_SEARCH_MAX_RESULTS", 3, 1, 3),
-                   search_timeout_seconds=_audio_float(values, "MIRROR_SEARCH_TIMEOUT_SECONDS", 12.0, 2.0, 30.0),
-                   search_cache_seconds=_audio_int(values, "MIRROR_SEARCH_CACHE_SECONDS", 300, 0, 3600),
-                   search_daily_budget=_audio_int(values, "MIRROR_SEARCH_DAILY_BUDGET", 10, 0, 1000),
                    wake_enabled=wake_enabled, wake_phrase=wake_phrase, wake_model_dir=wake_model_dir,
                    wake_cooldown_seconds=_audio_float(values, "MIRROR_WAKE_COOLDOWN_SECONDS", 5.0, 0.5, 30.0),
                    wake_first_speech_seconds=_audio_int(values, "MIRROR_WAKE_FIRST_SPEECH_SECONDS", 8, 3, 60),
