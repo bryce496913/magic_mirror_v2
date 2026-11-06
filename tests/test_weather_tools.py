@@ -70,6 +70,17 @@ def service(*, zone="America/New_York", now=None, unit="celsius", location=None)
     return weather, calls, payload, locations
 
 
+def geocoded_service(results, *, zone="America/New_York"):
+    weather, calls, payload, _ = service(zone=zone, now=instant(zone))
+
+    async def fetch(url, params):
+        calls.append((url, params))
+        return {"results": results} if url == GEOCODE_URL else payload
+
+    weather.fetch_json = fetch
+    return weather, calls, payload
+
+
 def run(coro):
     return asyncio.run(coro)
 
@@ -185,6 +196,106 @@ def test_overseas_location_and_ambiguous_location():
     assert len(ambiguous["candidates"]) == 2
     qualified = run(second.current({"location": "Auckland, NZ"}))
     assert qualified["availability"] == "available"
+
+
+@pytest.mark.parametrize("requested,geocode_name", [
+    ("New York City", "New York"),
+    ("New York", "New York"),
+    ("New York, United States", "New York"),
+    ("New York City, USA", "New York"),
+    ("NYC, NY", "New York"),
+    ("New York City, New York, United States", "New York"),
+    ("  new   york   city , U.S.A. ", "New York"),
+])
+def test_new_york_alias_preserves_geography(requested, geocode_name):
+    new_york = {"name": "New York", "admin1": "New York", "country": "United States",
+                "country_code": "US", "latitude": 40.71, "longitude": -74.01,
+                "population": 8_000_000}
+    other = {"name": "New York", "admin1": "Victoria", "country": "Australia",
+             "country_code": "AU", "latitude": -37.0, "longitude": 145.0,
+             "population": 9_000_000}
+    # A plain city name keeps the established population ranking; the alias
+    # must stay pinned even when an unrelated namesake ranks higher.
+    weather, calls, _ = geocoded_service(
+        [other, new_york] if "city" in requested.casefold() or "nyc" in requested.casefold()
+        else [new_york])
+    result = run(weather.current({"location": requested}))
+    assert result["availability"] == "available"
+    assert result["location"] == "New York, New York, United States"
+    assert calls[0][1]["name"] == geocode_name
+    assert calls[1][1]["latitude"] == 40.71
+
+
+def test_city_alias_never_selects_unrelated_country_or_region():
+    results = [{"name": "New York", "admin1": "Victoria", "country": "Australia",
+                "country_code": "AU", "latitude": -37.0, "longitude": 145.0,
+                "population": 9_000_000}]
+    weather, calls, _ = geocoded_service(results)
+    assert run(weather.current({"location": "New York City"})) == {
+        "availability": "unavailable", "reason": "location_not_found"}
+    assert run(weather.current({"location": "New York City, Australia"}))["reason"] == "location_not_found"
+    assert all(url == GEOCODE_URL for url, _ in calls)
+    namesake = {**results[0], "admin1": "Texas", "country": "United States", "country_code": "US"}
+    weather, _, _ = geocoded_service([namesake])
+    assert run(weather.current({"location": "NYC"}))["reason"] == "location_not_found"
+
+
+def test_springfield_remains_ambiguous_and_qualifiers_are_all_required():
+    results = [
+        {"name": "Springfield", "admin1": "Illinois", "country": "United States",
+         "country_code": "US", "latitude": 39.78, "longitude": -89.64, "population": 115000},
+        {"name": "Springfield", "admin1": "Massachusetts", "country": "United States",
+         "country_code": "US", "latitude": 42.10, "longitude": -72.59, "population": 154000},
+    ]
+    weather, _, _ = geocoded_service(results)
+    ambiguous = run(weather.current({"location": "Springfield"}))
+    assert ambiguous["availability"] == "ambiguous" and len(ambiguous["candidates"]) == 2
+    qualified = run(weather.current({"location": "Springfield, Illinois, USA"}))
+    assert qualified["location"] == "Springfield, Illinois, United States"
+    assert run(weather.current({"location": "Springfield, Illinois, Canada"}))["reason"] == "location_not_found"
+
+
+def test_tokyo_tomorrow_forecast_and_missing_city_data():
+    tokyo = {"name": "Tokyo", "admin1": "Tokyo", "country": "Japan", "country_code": "JP",
+             "latitude": 35.68, "longitude": 139.69, "population": 13_000_000}
+    weather, calls, payload = geocoded_service([tokyo], zone="Asia/Tokyo")
+    tomorrow = run(weather.forecast({"location": "Tokyo, Japan", "period": "tomorrow"}))
+    assert tomorrow["availability"] == "available" and tomorrow["period"] == "tomorrow"
+    assert tomorrow["location"] == "Tokyo, Tokyo, Japan" and len(tomorrow["days"]) == 1
+    assert calls[0][1]["name"] == "Tokyo"
+    payload["current"] = {}
+    current = run(weather.current({"location": "Tokyo, Japan"}))
+    assert current == {"availability": "unavailable", "reason": "current_data_missing"}
+
+
+def test_malformed_city_arguments_and_geocoding_results_fail_closed():
+    weather, calls, _ = geocoded_service([])
+    for location in (42, ["New York"], "New York City,, USA", "New York City, USA, extra, part"):
+        assert run(weather.current({"location": location}))["availability"] == "unavailable"
+    assert calls == []
+    assert run(weather.current({"location": "Unknown City"}))["reason"] == "location_not_found"
+    weather, _, _ = geocoded_service([])
+
+    async def malformed(_url, _params):
+        return ["unexpected"]
+
+    weather.fetch_json = malformed
+    assert run(weather.current({"location": "New York City"})) == {
+        "availability": "unavailable", "reason": "invalid_provider_data"}
+
+
+def test_weather_unavailability_is_distinct_from_dispatch_success(caplog):
+    weather, _, _ = geocoded_service([])
+    registry = default_registry(weather.settings)
+    registry.get("get_current_weather").executor.__self__.fetch_json = weather.fetch_json
+    with caplog.at_level("INFO", logger="magic_mirror.assistant.tools.registry"):
+        result = run(ToolDispatcher(registry, weather.settings).execute(
+            "get_current_weather", '{"location":"Unpublished Private Place"}'))
+    assert result.status == ToolStatus.SUCCESS
+    assert result.data == {"availability": "unavailable", "reason": "location_not_found"}
+    assert "execution result (success)" in caplog.text
+    assert "weather availability (unavailable)" in caplog.text
+    assert "Unpublished Private Place" not in caplog.text
 
 
 def test_local_midnight_and_daylight_saving_fold():

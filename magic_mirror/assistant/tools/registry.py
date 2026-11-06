@@ -157,6 +157,11 @@ class ToolDispatcher:
                 LOGGER.info("Tool %s execution result (provider_failure)", spec.name)
                 return ToolResult(ToolStatus.PROVIDER_FAILURE)
             LOGGER.info("Tool %s execution result (success)", spec.name)
+            if spec.name in {"get_current_weather", "get_weather_forecast"}:
+                availability = output.get("availability")
+                if isinstance(availability, str) and availability in {
+                        "available", "unavailable", "ambiguous"}:
+                    LOGGER.info("Tool %s weather availability (%s)", spec.name, availability)
             return result
         except TimeoutError:
             LOGGER.info("Tool %s execution result (timeout)", spec.name)
