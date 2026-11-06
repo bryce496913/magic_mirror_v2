@@ -11,7 +11,7 @@ from websockets.frames import Close
 
 from magic_mirror.assistant.client import RealtimeClient, RealtimeError
 from magic_mirror.assistant.display import AssistantStateStore
-from magic_mirror.assistant.events import ConversationEvent, ConversationState, EventTracker, FunctionCall
+from magic_mirror.assistant.events import ConversationEvent, ConversationState, EventTracker, FunctionCall, PlaybackAction
 from magic_mirror.assistant.tools import (Permission, ToolCancelled, ToolDispatcher, ToolRegistry,
                                           ToolSpec, ToolStatus, default_registry)
 from magic_mirror.assistant.voice import VoiceError, VoicePhase
@@ -927,7 +927,7 @@ def test_long_search_audio_burst_keeps_receiving_while_speaker_is_slow(monkeypat
         original_write = audio.playback.write
 
         def slow_write(frames, timeout=None):
-            release.wait(10)
+            release.wait()
             return original_write(frames, timeout)
 
         audio.playback.write = slow_write
@@ -966,27 +966,91 @@ def test_long_search_audio_burst_keeps_receiving_while_speaker_is_slow(monkeypat
             assert 8 < voice._output_queue_peak <= voice._output.maxsize
             assert ticks > 20  # receive work yielded to keepalive and playback tasks
             assert store.snapshot().sources and not store.snapshot().assistant_text
-            release.set()
-            await asyncio.wait_for(_wait_for_phase(voice, VoicePhase.LISTENING), 5)
-            assert store.snapshot().assistant_text == "Official spoken answer."
-            assert store.snapshot().sources
+            # The speaker is still gated. The completion marker must remain
+            # behind every received audio chunk, regardless of Pi thread speed.
+            await wait_until(lambda: audio.playback.starts == 1)
+            pending = list(voice._output._queue)
+            assert len(pending) == 200  # 199 chunks plus the completion marker
+            assert all(chunk is not None for _, _, chunk in pending[:-1])
+            assert pending[-1][2] is None
         finally:
             tick_stop = True
+            voice.stop_event.set()
             release.set()
             await ticker
-            voice.stop_event.set()
             await asyncio.wait_for(task, 2)
         assert audio.closed and client.closed
-
-    async def _wait_for_phase(voice, phase):
-        while voice.phase != phase:
-            await asyncio.sleep(0.005)
 
     with caplog.at_level(logging.INFO):
         asyncio.run(asyncio.wait_for(scenario(), 12))
     assert "Realtime audio received (events=200, duration_ms=20000" in caplog.text
     assert "Realtime continuation completed (status=completed, first_audio=True)" in caplog.text
     assert "latest release" not in caplog.text
+
+
+def test_search_playback_drains_in_order_before_returning_to_listening(monkeypatch):
+    from magic_mirror.assistant.tools.search import WebSearch
+
+    async def search(_self, _arguments):
+        return {"availability": "available", "summary": "Official update [1].", "sources": [{
+            "title": "Official", "url": "https://example.org/update", "source_name": "example.org"}]}
+
+    monkeypatch.setattr(WebSearch, "search", search)
+
+    async def scenario():
+        store = AssistantStateStore()
+        store.on_state(WakeState.LISTENING)
+        voice, audio, client, _, _ = make_voice(tools_enabled=True, search_enabled=True,
+                                                openai_api_key="fixture-only-key")
+        release = threading.Event()
+        original_write = audio.playback.write
+        written = []
+        completed = asyncio.Event()
+
+        def gated_write(frames, timeout=None):
+            release.wait()
+            written.append(int(frames[-1, 0]))
+            return original_write(frames, timeout)
+
+        def on_playback(playback_event):
+            store.on_playback(playback_event)
+            if playback_event.action == PlaybackAction.COMPLETED:
+                completed.set()
+
+        audio.playback.write = gated_write
+        voice.on_event = store.on_event
+        voice.on_playback = on_playback
+        voice.on_sources = store.on_sources
+        task = asyncio.create_task(voice.run())
+        try:
+            await wait_until(lambda: audio.capture.active)
+            client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user"))
+            client.queue.put_nowait(event("response.created", response="tool"))
+            client.queue.put_nowait(tool_done("tool", tool_call(
+                "call", name="search_web", arguments='{"query":"latest release"}')))
+            await wait_until(lambda: any(x["type"] == "response.create" for x in client.sent))
+            client.queue.put_nowait(event("response.created", response="spoken"))
+            for value in (1000, 2000, 3000):
+                client.queue.put_nowait(event("response.output_audio.delta", response="spoken",
+                                              item="audio", audio=pcm_audio(value=value)))
+            client.queue.put_nowait(event("response.output_audio_transcript.done", response="spoken",
+                                          item="audio", role="assistant", text="Official spoken answer.", final=True))
+            client.queue.put_nowait(event("response.done", response="spoken", status="completed"))
+            await wait_until(lambda: "spoken" in voice._finished_responses and audio.playback.starts == 1)
+            assert [item[2] is None for item in voice._output._queue] == [False, False, True]
+            assert not completed.is_set() and not store.snapshot().assistant_text
+            release.set()
+            await asyncio.wait_for(completed.wait(), 2)  # only three immediate fake writes
+            assert len(written) == 3 and written == sorted(written) and len(set(written)) == 3
+            assert voice.phase == VoicePhase.LISTENING
+            assert store.snapshot().assistant_text == "Official spoken answer."
+            assert store.snapshot().sources
+        finally:
+            release.set()
+            voice.stop_event.set()
+            await asyncio.wait_for(task, 2)
+
+    asyncio.run(asyncio.wait_for(scenario(), 5))
 
 
 def test_playback_backlog_limit_fails_safely_without_blocking_receive(monkeypatch, caplog):
