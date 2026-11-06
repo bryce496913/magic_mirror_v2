@@ -525,6 +525,68 @@ def test_weather_result_correlates_with_spoken_continuation(monkeypatch):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("forecast_available", [True, False])
+def test_tokyo_current_and_tomorrow_calls_share_spoken_turn(monkeypatch, forecast_available):
+    from magic_mirror.assistant.tools.weather import WeatherTools
+
+    async def current(_self, arguments):
+        assert arguments == {"location": "Tokyo, Japan"}
+        return {"availability": "available", "location": "Tokyo, Japan",
+                "temperature": {"fahrenheit": 68, "celsius": 20}}
+
+    async def forecast(_self, arguments):
+        assert arguments == {"location": "Tokyo, Japan", "period": "tomorrow"}
+        if not forecast_available:
+            return {"availability": "unavailable", "reason": "forecast_data_missing"}
+        return {"availability": "available", "location": "Tokyo, Japan", "period": "tomorrow",
+                "days": [{"date": "2026-11-03", "high": {"fahrenheit": 70, "celsius": 21.1}}]}
+
+    monkeypatch.setattr(WeatherTools, "current", current)
+    monkeypatch.setattr(WeatherTools, "forecast", forecast)
+
+    async def scenario():
+        store = AssistantStateStore()
+        store.on_state(WakeState.LISTENING)
+        voice, audio, client, _, _ = make_voice(tools_enabled=True)
+        voice.on_event = store.on_event
+        voice.on_playback = store.on_playback
+        task = asyncio.create_task(voice.run())
+        try:
+            await wait_until(lambda: audio.capture.active)
+            instructions = client.sent[0]["session"]["instructions"]
+            assert "use both weather tools" in instructions
+            client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user"))
+            client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="user"))
+            client.queue.put_nowait(event("response.created", response="tokyo-tools"))
+            client.queue.put_nowait(tool_done(
+                "tokyo-tools",
+                tool_call("current-id", name="get_current_weather",
+                          arguments='{"location":"Tokyo, Japan"}', item_id="current-item"),
+                tool_call("forecast-id", name="get_weather_forecast",
+                          arguments='{"location":"Tokyo, Japan","period":"tomorrow"}',
+                          item_id="forecast-item")))
+            await wait_until(lambda: any(x["type"] == "response.create" for x in client.sent))
+            outputs = sent_outputs(client)
+            assert [x["call_id"] for x in outputs] == ["current-id", "forecast-id"]
+            assert [json.loads(x["output"])["data"]["availability"] for x in outputs] == [
+                "available", "available" if forecast_available else "unavailable"]
+            assert sum(x["type"] == "response.create" for x in client.sent) == 1
+            client.queue.put_nowait(event("response.created", response="spoken-tokyo"))
+            client.queue.put_nowait(event("response.output_audio.delta", response="spoken-tokyo",
+                                          item="audio", audio=pcm_audio()))
+            reply = "Tomorrow is 70 Fahrenheit." if forecast_available else "Tomorrow's forecast is unavailable."
+            client.queue.put_nowait(event("response.output_audio_transcript.done", response="spoken-tokyo",
+                                          item="audio", role="assistant", text=reply, final=True))
+            client.queue.put_nowait(event("response.done", response="spoken-tokyo", status="completed"))
+            await wait_until(lambda: voice.phase == VoicePhase.LISTENING and audio.playback.starts == 1)
+            assert store.snapshot().assistant_text == reply
+        finally:
+            voice.stop_event.set()
+            await task
+
+    asyncio.run(scenario())
+
+
 def test_weather_timeout_submits_bounded_failure_and_spoken_continuation(monkeypatch):
     from magic_mirror.assistant.tools.weather import WeatherTools
 

@@ -201,6 +201,8 @@ class VoiceConversation:
                                      "the paired values again or omit a unit because of the dashboard setting. "
                                      "Current Open-Meteo data is a model estimate, "
                                      "not a measured observation. Do not invent missing readings or forecasts. "
+                                     "If the user asks for current weather and a future forecast, use both "
+                                     "weather tools with the requested forecast period before answering. "
                                      "If availability is unavailable or ambiguous, say so and ask for a clearer location if needed."
                                      + search_guidance),
                 })
