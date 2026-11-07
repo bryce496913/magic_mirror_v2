@@ -25,6 +25,28 @@ MAX_CACHE = 16
 STALE_GRACE_SECONDS = 1800
 LOCATION = re.compile(r"[\w\s.,'’\-]{2,80}\Z", re.UNICODE)
 PERIODS = ("today", "tonight", "tomorrow", "afternoon", "weekend", "next_7_days")
+# Every alias is pinned to its actual country and region. Never fuzzy-match
+# arbitrary geocoder results or let a high-population namesake override it.
+CITY_ALIASES = {
+    "new york city": ("New York", "US", "New York"),
+    "nyc": ("New York", "US", "New York"),
+}
+
+
+def _location_key(value: str) -> str:
+    return " ".join(value.casefold().replace("’", "'").split())
+
+
+def _qualifier_matches(item: dict[str, Any], qualifier: str) -> bool:
+    key = _location_key(qualifier)
+    country = _location_key(item.get("country") or "") if isinstance(item.get("country"), str) else ""
+    code = _location_key(item.get("country_code") or "") if isinstance(item.get("country_code"), str) else ""
+    region = _location_key(item.get("admin1") or "") if isinstance(item.get("admin1"), str) else ""
+    if key in {"usa", "u.s.", "u.s.a.", "united states of america"}:
+        return code == "us" or country == "united states"
+    if key == "ny":
+        return region == "new york" and (code == "us" or country == "united states")
+    return key in {country, code, region}
 
 
 class WeatherUnavailable(Exception):
@@ -169,6 +191,8 @@ class WeatherTools:
         self._lock = asyncio.Lock()
 
     async def _resolve(self, requested: str | None) -> Place | dict[str, Any]:
+        if requested is not None and not isinstance(requested, str):
+            return {"availability": "unavailable", "reason": "invalid_location"}
         if requested is None or not requested.strip():
             if self.settings.weather_latitude is None or self.settings.weather_longitude is None:
                 return {"availability": "unavailable", "reason": "default_location_not_configured"}
@@ -184,20 +208,27 @@ class WeatherTools:
             return {"availability": "unavailable", "reason": "invalid_location"}
         if requested.casefold() in self._places:
             return self._places[requested.casefold()]
-        city, separator, qualifier = requested.partition(",")
-        if not city.strip() or separator and not qualifier.strip():
+        parts = [part.strip() for part in requested.split(",")]
+        if len(parts) > 3 or any(not part for part in parts):
             return {"availability": "unavailable", "reason": "invalid_location"}
-        results = (await self.fetch_json(GEOCODE_URL, {"name": city.strip(), "count": 10,
-                                                       "language": "en", "format": "json"})).get("results", [])
+        city, *qualifiers = parts
+        alias = CITY_ALIASES.get(_location_key(city))
+        geocode_name = alias[0] if alias else city
+        response = await self.fetch_json(GEOCODE_URL, {"name": geocode_name, "count": 10,
+                                                      "language": "en", "format": "json"})
+        if not isinstance(response, dict):
+            return {"availability": "unavailable", "reason": "invalid_provider_data"}
+        results = response.get("results", [])
         if not isinstance(results, list) or not results:
             return {"availability": "unavailable", "reason": "location_not_found"}
         matches = [item for item in results if isinstance(item, dict) and
-                   isinstance(item.get("name"), str) and item["name"].casefold() == city.strip().casefold()]
-        if qualifier:
-            part = qualifier.strip().casefold()
-            matches = [item for item in matches if part in (
-                str(item.get("country", "")).casefold(), str(item.get("country_code", "")).casefold(),
-                str(item.get("admin1", "")).casefold())]
+                   isinstance(item.get("name"), str) and
+                   _location_key(item["name"]) == _location_key(geocode_name)]
+        if alias:
+            matches = [item for item in matches if
+                       _qualifier_matches(item, alias[1]) and _qualifier_matches(item, alias[2])]
+        for qualifier in qualifiers:
+            matches = [item for item in matches if _qualifier_matches(item, qualifier)]
         if not matches:
             return {"availability": "unavailable", "reason": "location_not_found"}
         matches.sort(key=lambda x: _number(x.get("population"), low=0, high=1e9) or 0, reverse=True)
