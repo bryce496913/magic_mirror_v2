@@ -36,10 +36,20 @@ async def _interactive(settings: Settings) -> None:
         print(f"Wake state: {state.value}", flush=True)
 
     def metrics(value: WakeMetrics) -> None:
-        print(f"Idle process CPU: {value.cpu_percent:.1f}%; RSS: {value.rss_mib:.1f} MiB; "
+        tools = value.tools
+        estimate = (f"${tools.search_requests * settings.search_estimated_usd_per_request:.4f}"
+                    if settings.search_estimated_usd_per_request else "unknown")
+        print(f"Process CPU: {value.cpu_percent:.1f}%; RSS: {value.rss_mib:.1f} MiB; "
               f"established TCP: {value.established_tcp}; "
               f"frames: {value.audio_frames}; activations: {value.activations}; "
-              f"false activations: {value.false_activations}", flush=True)
+              f"false activations: {value.false_activations}; "
+              f"sessions: {value.sessions}; session seconds: {value.session_seconds:.1f}; "
+              f"tools: {tools.invocations} total/{tools.successes} success/{tools.failures} failed/"
+              f"{tools.cancellations} cancelled; total/max tool latency: "
+              f"{tools.total_latency_ms}/{tools.max_latency_ms} ms; "
+              f"search requests: {tools.search_requests}; reported search tokens: "
+              f"{tools.search_input_tokens} in/{tools.search_output_tokens} out; "
+              f"estimated search cost: {estimate}", flush=True)
 
     controller = WakeController(settings, on_state=state_changed, on_metrics=metrics,
                                 on_voice_event=store.on_event, on_playback=store.on_playback,

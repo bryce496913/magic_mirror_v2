@@ -1,14 +1,17 @@
 """Mocked hosted-search and budget tests; these never call a paid API."""
 
 import asyncio
+import fcntl
 import json
+import os
 import stat
 from datetime import datetime, timezone
 
 import httpx
 import pytest
 
-from magic_mirror.assistant.tools.registry import ToolDispatcher, ToolStatus, default_registry
+from magic_mirror.assistant.tools.registry import (Permission, ToolDispatcher, ToolRegistry,
+                                                   ToolSpec, ToolStatus, default_registry)
 from magic_mirror.assistant.tools.search import (
     RESPONSES_URL, DailyBudget, SearchFailure, WebSearch, _public_url,
 )
@@ -53,6 +56,17 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def dispatcher_for(search):
+    registry = ToolRegistry()
+    registry.register(ToolSpec(
+        name="search_web", description="Mocked read-only search.",
+        parameters={"type": "object", "properties": {"query": {"type": "string"}},
+                    "required": ["query"], "additionalProperties": False},
+        enabled=True, permission=Permission.READ_ONLY, executor=search.search,
+        timeout_seconds=2, max_input_bytes=256, max_output_bytes=2048))
+    return ToolDispatcher(registry, search.settings)
+
+
 def test_success_citations_dates_metrics_and_fixed_request(tmp_path):
     search, calls, budget = service(tmp_path)
     result = run(search.search({"query": "Latest Raspberry Pi OS release", "freshness": "week"}))
@@ -72,6 +86,23 @@ def test_success_citations_dates_metrics_and_fixed_request(tmp_path):
     assert payload["tools"] == [{"type": "web_search", "search_context_size": "low"}]
     assert payload["include"] == ["web_search_call.action.sources"]
     assert "fixture-only-key" not in json.dumps(payload)
+
+
+def test_search_diagnostics_count_budget_reservations_and_reported_tokens(tmp_path):
+    search, _, _ = service(tmp_path)
+    dispatcher = dispatcher_for(search)
+    assert run(dispatcher.execute("search_web", '{"query":"latest news"}')).status == ToolStatus.SUCCESS
+    sample = dispatcher.metrics()
+    assert (sample.invocations, sample.successes, sample.failures, sample.search_requests) == (1, 1, 0, 1)
+    assert (sample.search_input_tokens, sample.search_output_tokens) == (350, 80)
+
+    async def unavailable(_payload):
+        raise SearchFailure("rate_limited")
+
+    failed, _, _ = service(tmp_path, requester=unavailable)
+    second = dispatcher_for(failed)
+    assert run(second.execute("search_web", '{"query":"current events"}')).status == ToolStatus.SUCCESS
+    assert (second.metrics().failures, second.metrics().search_requests) == (1, 1)
 
 
 def test_multiple_claims_dates_contradiction_and_missing_publication(tmp_path):
@@ -132,6 +163,20 @@ def test_cache_limit_and_daily_budget_persist_across_instances(tmp_path):
     assert run(second.search({"query": "latest world news"}))["reason"] == "daily_budget_exhausted"
     assert len(calls_second) == 1
     assert json.loads(budget.path.read_text())["count"] == 2
+
+
+def test_busy_budget_lock_fails_closed_without_waiting_for_cancellation(tmp_path):
+    budget = DailyBudget(tmp_path / ".private" / "counter.json", now=lambda: NOW)
+    assert budget.reserve(2) == 1
+    fd = os.open(budget.path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(SearchFailure, match="budget_unavailable"):
+            budget.reserve(2)
+        assert json.loads(budget.path.read_text())["count"] == 1
+    finally:
+        os.close(fd)
+    assert budget.reserve(2) == 0
 
 
 @pytest.mark.parametrize("reason", ["provider_timeout", "authentication_failed", "rate_limited",
@@ -196,6 +241,28 @@ def test_cancellation_discards_late_result_but_reserves_budget(tmp_path):
         release.set()
         assert search._cache == {}
         assert json.loads(budget.path.read_text())["count"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_search_still_reports_possible_cost_without_retaining_query(tmp_path):
+    async def scenario():
+        entered = asyncio.Event()
+
+        async def slow(_payload):
+            entered.set()
+            await asyncio.Event().wait()
+
+        search, _, _ = service(tmp_path, requester=slow)
+        dispatcher = dispatcher_for(search)
+        task = asyncio.create_task(dispatcher.execute("search_web", '{"query":"private question"}'))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        sample = dispatcher.metrics()
+        assert (sample.invocations, sample.cancellations, sample.search_requests) == (1, 1, 1)
+        assert "private question" not in repr(sample)
 
     asyncio.run(scenario())
 

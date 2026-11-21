@@ -135,6 +135,7 @@ class Settings:
     search_timeout_seconds: float = 12.0
     search_cache_seconds: int = 300
     search_daily_budget: int = 10
+    search_estimated_usd_per_request: float = 0.0
     wake_enabled: bool = False
     wake_phrase: str = "magic mirror"
     wake_model_dir: str = ""
@@ -311,6 +312,8 @@ class Settings:
                    search_timeout_seconds=_audio_float(values, "MIRROR_SEARCH_TIMEOUT_SECONDS", 12.0, 2.0, 30.0),
                    search_cache_seconds=_audio_int(values, "MIRROR_SEARCH_CACHE_SECONDS", 300, 0, 3600),
                    search_daily_budget=_audio_int(values, "MIRROR_SEARCH_DAILY_BUDGET", 10, 0, 1000),
+                   search_estimated_usd_per_request=_audio_float(
+                       values, "MIRROR_SEARCH_ESTIMATED_USD_PER_REQUEST", 0.0, 0.0, 100.0),
                    wake_enabled=wake_enabled, wake_phrase=wake_phrase, wake_model_dir=wake_model_dir,
                    wake_cooldown_seconds=_audio_float(values, "MIRROR_WAKE_COOLDOWN_SECONDS", 5.0, 0.5, 30.0),
                    wake_first_speech_seconds=_audio_int(values, "MIRROR_WAKE_FIRST_SPEECH_SECONDS", 8, 3, 60),

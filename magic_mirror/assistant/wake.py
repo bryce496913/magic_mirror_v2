@@ -4,7 +4,7 @@ import asyncio
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
@@ -17,6 +17,7 @@ from .client import RealtimeError
 from .events import ConversationEvent, PlaybackEvent
 from .voice import VoiceConversation, VoiceError
 from .tool_visual import ToolVisual
+from .tools.registry import ToolMetrics
 
 READ_MS = 100
 MAX_RECOVERY_ATTEMPTS = 3
@@ -45,6 +46,9 @@ class WakeMetrics:
     audio_frames: int
     activations: int
     false_activations: int
+    sessions: int = 0
+    session_seconds: float = 0.0
+    tools: ToolMetrics = field(default_factory=ToolMetrics)
 
 
 class DecimateTo16k:
@@ -179,6 +183,9 @@ class WakeController:
         self.audio_frames = 0
         self.activations = 0
         self.false_activations = 0
+        self.sessions = 0
+        self.session_seconds = 0.0
+        self.tool_metrics = ToolMetrics()
         self._next_wake = 0.0
         self._last_metrics = self.clock()
 
@@ -196,7 +203,8 @@ class WakeController:
         return WakeMetrics(self.process.cpu_percent(interval=None),
                            self.process.memory_info().rss / (1024 * 1024),
                            tcp,
-                           self.audio_frames, self.activations, self.false_activations)
+                           self.audio_frames, self.activations, self.false_activations,
+                           self.sessions, self.session_seconds, self.tool_metrics)
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -285,6 +293,8 @@ class WakeController:
             await asyncio.to_thread(self.audio.capture.stop)
             await asyncio.gather(drain_task, return_exceptions=True)
             raise WakeError("Unable to initialize voice handoff") from None
+        session_started = self.clock()
+        self.sessions += 1
         voice_task = asyncio.create_task(self.voice.run())
         stopper = asyncio.create_task(self.stop_event.wait())
         try:
@@ -310,6 +320,22 @@ class WakeController:
             if not self.voice.heard_speech:
                 self.false_activations += 1
         finally:
+            self.session_seconds += max(0.0, self.clock() - session_started)
+            dispatcher = getattr(self.voice, "tool_dispatcher", None)
+            if dispatcher is not None:
+                current = dispatcher.metrics()
+                previous = self.tool_metrics
+                self.tool_metrics = ToolMetrics(
+                    invocations=previous.invocations + current.invocations,
+                    successes=previous.successes + current.successes,
+                    failures=previous.failures + current.failures,
+                    cancellations=previous.cancellations + current.cancellations,
+                    total_latency_ms=previous.total_latency_ms + current.total_latency_ms,
+                    max_latency_ms=max(previous.max_latency_ms, current.max_latency_ms),
+                    search_requests=previous.search_requests + current.search_requests,
+                    search_input_tokens=previous.search_input_tokens + current.search_input_tokens,
+                    search_output_tokens=previous.search_output_tokens + current.search_output_tokens,
+                )
             drain_stop.set()
             if not drain_task.done():
                 await asyncio.to_thread(self.audio.capture.stop)
@@ -317,6 +343,8 @@ class WakeController:
             stopper.cancel()
             self.voice = None
             self._state(WakeState.RETURNING_IDLE)
+            if self.on_metrics is not None:
+                self.on_metrics(self.metrics())
 
     async def run(self) -> None:
         if not self.settings.wake_enabled:
