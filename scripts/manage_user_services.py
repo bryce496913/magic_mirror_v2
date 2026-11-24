@@ -2,8 +2,6 @@
 """Explicit install, activation, and rollback of the Pi user's systemd units."""
 
 import argparse
-import configparser
-import io
 import os
 import stat
 import subprocess
@@ -27,6 +25,16 @@ def _systemctl(*args: str) -> None:
     subprocess.run(["systemctl", "--user", *args], check=True)
 
 
+def _is_active(name: str) -> bool:
+    return subprocess.run(["systemctl", "--user", "is-active", "--quiet", name],
+                          check=False).returncode == 0
+
+
+def _is_enabled(name: str) -> bool:
+    return subprocess.run(["systemctl", "--user", "is-enabled", "--quiet", name],
+                          check=False).returncode == 0
+
+
 def _unit_directory() -> Path:
     return Path.home() / ".config" / "systemd" / "user"
 
@@ -36,20 +44,11 @@ def _selected(target: str) -> dict[str, str]:
 
 
 def _matching_unit(path: Path, name: str) -> bool:
-    if path.is_symlink() or not path.is_file():
+    if path.name != name or path.is_symlink() or not path.is_file() or name not in UNITS.values():
         return False
-    unit = configparser.ConfigParser(interpolation=None)
     try:
-        unit.read_file(io.StringIO(path.read_text()))
-        expected_start = {
-            UNITS["dashboard"]: f"{PROJECT}/scripts/run_pi.sh",
-            UNITS["voice"]: f"{PROJECT}/.venv/bin/python -m magic_mirror.assistant.wake_cli --start",
-        }
-        return (path.name == name and
-                unit["Unit"]["Description"].startswith("Magic Mirror V2 ") and
-                unit["Service"]["WorkingDirectory"] == str(PROJECT) and
-                unit["Service"]["ExecStart"] == expected_start[name])
-    except (OSError, UnicodeError, configparser.Error, KeyError):
+        return path.read_bytes() == (SOURCE / name).read_bytes()
+    except OSError:
         return False
 
 
@@ -67,7 +66,12 @@ def install_units(destination: Path, target: str = "both", *, systemctl=_systemc
         if not target.exists():
             target.write_bytes((SOURCE / name).read_bytes())
             target.chmod(0o644)
-    systemctl("daemon-reload")
+    try:
+        systemctl("daemon-reload")
+    except subprocess.CalledProcessError as exc:
+        raise ServiceSetupError(
+            "User unit files were copied but daemon-reload failed; check the user systemd manager "
+            "and run `systemctl --user daemon-reload`. No service was enabled or started") from exc
 
 
 def _managed_pids(names: dict[str, str]) -> set[int]:
@@ -82,7 +86,7 @@ def _managed_pids(names: dict[str, str]) -> set[int]:
 
 def manual_instances(*, proc: Path = Path("/proc"), uid: int | None = None,
                      managed: set[int] | None = None) -> dict[str, list[int]]:
-    """Find foreground launches from this checkout under the service account."""
+    """Conservatively find same-user foreground launches of the application."""
     uid = os.getuid() if uid is None else uid
     managed = managed or set()
     found: dict[str, list[int]] = {kind: [] for kind in UNITS}
@@ -93,11 +97,15 @@ def manual_instances(*, proc: Path = Path("/proc"), uid: int | None = None,
         if pid in managed:
             continue
         try:
-            if entry.stat().st_uid != uid or Path(os.readlink(entry / "cwd")) != PROJECT:
+            if entry.stat().st_uid != uid:
                 continue
             argv = (entry / "cmdline").read_bytes().decode(errors="replace").split("\0")
-        except (OSError, PermissionError):
+        except OSError:
             continue
+        try:
+            cwd = Path(os.readlink(entry / "cwd"))
+        except OSError:
+            cwd = None  # module invocations remain detectable without cwd access
         for index, arg in enumerate(argv[:-1]):
             if arg == "-m" and argv[index + 1] == "magic_mirror":
                 found["dashboard"].append(pid)
@@ -105,19 +113,24 @@ def manual_instances(*, proc: Path = Path("/proc"), uid: int | None = None,
                     "magic_mirror.assistant.wake_cli", "magic_mirror.assistant.voice_cli"}
                     and "--start" in argv):
                 found["voice"].append(pid)
-        if any(arg.endswith("/scripts/run_pi.sh") for arg in argv):
+        if any(arg == str(PROJECT / "scripts" / "run_pi.sh") or
+               (arg.endswith("/scripts/run_pi.sh") and cwd == PROJECT) for arg in argv):
             found["dashboard"].append(pid)
     return found
 
 
-def _verify_installed(destination: Path, names: dict[str, str]) -> None:
+def _verify_installed(destination: Path, names: dict[str, str], *, allow_missing: bool = False) -> None:
     for name in names.values():
-        if not _matching_unit(destination / name, name):
+        path = destination / name
+        if allow_missing and not path.exists() and not path.is_symlink():
+            continue
+        if not _matching_unit(path, name):
             raise ServiceSetupError(f"{name} is missing or not a recognized Magic Mirror unit")
 
 
 def activate_units(destination: Path, target: str, *, project: Path = PROJECT, systemctl=_systemctl,
-                   instances=manual_instances) -> None:
+                   instances=manual_instances, is_active=_is_active,
+                   is_enabled=_is_enabled) -> None:
     """Explicit enablement, guarded against duplicate manual processes."""
     names = _selected(target)
     _verify_installed(destination, names)
@@ -136,18 +149,72 @@ def activate_units(destination: Path, target: str, *, project: Path = PROJECT, s
         if found[kind]:
             raise ServiceSetupError(f"Manual {kind} process still running (PID {found[kind][0]}); stop it first")
     for name in names.values():
-        systemctl("enable", "--now", name)
+        was_active = is_active(name)
+        was_enabled = is_enabled(name)
+        try:
+            # Starting first leaves the existing enablement unchanged if startup fails.
+            systemctl("start", name)
+        except subprocess.CalledProcessError as exc:
+            raise ServiceSetupError(
+                f"{name} failed to start; check `systemctl --user status {name}` and "
+                f"`journalctl --user -u {name} -n 50`. Earlier services may be running; "
+                "inspect both before retrying or rolling back") from exc
+        try:
+            systemctl("enable", name)
+        except subprocess.CalledProcessError as exc:
+            cleanup = []
+            if not was_active:
+                try:
+                    systemctl("stop", name)
+                    cleanup.append("Stopped the newly started unit.")
+                except subprocess.CalledProcessError:
+                    cleanup.append("Could not stop the newly started unit; inspect its status immediately.")
+            else:
+                cleanup.append("The previously active unit was left running.")
+            if not was_enabled:
+                try:
+                    systemctl("disable", name)
+                    cleanup.append("Removed any partial boot enablement.")
+                except subprocess.CalledProcessError:
+                    cleanup.append("Could not clear partial boot enablement; inspect is-enabled immediately.")
+            raise ServiceSetupError(
+                f"{name} started but could not be enabled. {' '.join(cleanup)} Check "
+                f"`systemctl --user status {name}` and `journalctl --user -u {name} -n 50`; "
+                "earlier services may be running") from exc
 
 
 def rollback_units(destination: Path, target: str, *, systemctl=_systemctl) -> None:
     """Stop and disable selected services, then remove only recognized units."""
     names = _selected(target)
-    _verify_installed(destination, names)
-    for name in names.values():
-        systemctl("disable", "--now", name)
-    for name in names.values():
-        (destination / name).unlink()
-    systemctl("daemon-reload")
+    _verify_installed(destination, names, allow_missing=True)
+    present = {kind: name for kind, name in names.items()
+               if (destination / name).exists() or (destination / name).is_symlink()}
+    for name in present.values():
+        try:
+            systemctl("disable", "--now", name)
+        except subprocess.CalledProcessError as exc:
+            raise ServiceSetupError(
+                f"Could not stop/disable {name}; no unit files were removed. "
+                "Earlier units may already be stopped. Check `systemctl --user status` and "
+                "the user journal, then retry rollback") from exc
+    # Recheck after systemctl calls so a replaced unit cannot be deleted.
+    _verify_installed(destination, present)
+    failed = []
+    for name in present.values():
+        try:
+            (destination / name).unlink()
+        except OSError:
+            failed.append(name)
+    try:
+        systemctl("daemon-reload")
+    except subprocess.CalledProcessError as exc:
+        raise ServiceSetupError(
+            "Unit files may have been removed but daemon-reload failed; run "
+            "`systemctl --user daemon-reload` and inspect unit status") from exc
+    if failed:
+        raise ServiceSetupError(
+            "Could not remove " + ", ".join(failed) + "; services were disabled. "
+            "Check user-unit directory permissions and retry rollback")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -171,6 +238,10 @@ def main(argv: list[str] | None = None) -> int:
             print("Selected user services stopped, disabled, and removed")
     except (ServiceSetupError, subprocess.CalledProcessError) as exc:
         print(f"User service setup failed: {exc}", file=sys.stderr)
+        return 1
+    except OSError:
+        print("User service setup failed: check local file permissions and the user systemd manager; "
+              "inspect service status before retrying or rolling back", file=sys.stderr)
         return 1
     return 0
 

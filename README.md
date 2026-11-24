@@ -171,7 +171,7 @@ The CLI also reports digital peak levels and the number of samples limited after
 
 For the hardware validation steps, including a private Pi-hole credential setup procedure and version check, see [Pass 3 Raspberry Pi validation](docs/PASS3_PI_VALIDATION.md).
 
-The manual Flask launcher remains available for development and rollback. Pass 7E-1 adds optional, separately supervised **user-level** dashboard and wake/voice services for the `bryce` account on the Raspberry Pi 5. Checking out the repository does not install or enable either service. See [Pass 7E-1 systemd installation and rollback](docs/PASS7E1_SYSTEMD_VALIDATION.md) for the explicit migration commands, boot and crash checks, audio readiness gate, and rollback. Chromium remains separately managed.
+The manual Flask launcher remains available for development and rollback. Pass 7E-1 adds optional, separately supervised **user-level** dashboard and wake/voice services for the `bryce` account on the Raspberry Pi 5. Checking out the repository does not install or enable either service. In systemd mode there is no interactive stdin: spoken sleep still works, while `c`, `e`, and `q` are unavailable; control the assistant with `systemctl --user stop`, `start`, or `restart magic-mirror-voice.service`. See [Pass 7E-1 systemd installation and rollback](docs/PASS7E1_SYSTEMD_VALIDATION.md) for the explicit migration commands, boot and crash checks, audio readiness gate, and rollback. Chromium remains separately managed.
 
 ## Raspberry Pi display check
 
