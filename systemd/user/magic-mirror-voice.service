@@ -1,0 +1,24 @@
+[Unit]
+Description=Magic Mirror V2 local wake and voice assistant
+Wants=pipewire.service wireplumber.service
+After=pipewire.service wireplumber.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+WorkingDirectory=/home/bryce/magic_mirror_v2
+Environment=MIRROR_LOG_LEVEL=INFO
+ExecStartPre=/home/bryce/magic_mirror_v2/.venv/bin/python -m magic_mirror.assistant.service_ready --wait-seconds 60
+ExecStart=/home/bryce/magic_mirror_v2/.venv/bin/python -m magic_mirror.assistant.wake_cli --start
+Restart=on-failure
+RestartSec=15s
+TimeoutStartSec=90s
+TimeoutStopSec=45s
+KillSignal=SIGTERM
+KillMode=control-group
+UMask=0077
+SyslogIdentifier=magic-mirror-voice
+
+[Install]
+WantedBy=default.target
