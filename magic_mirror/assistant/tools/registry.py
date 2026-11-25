@@ -187,7 +187,9 @@ def default_registry(settings: Settings) -> ToolRegistry:
     ))
     weather = WeatherTools(settings)
     location = {"type": "string", "minLength": 2, "maxLength": 80,
-                "description": "Optional city, or city and country/region. Omit for configured default."}
+                "description": ("Pass the named city when the user specifies one, optionally with "
+                                "state/region and country. Omit only when no location was requested; "
+                                "an empty location is invalid.")}
     registry.register(ToolSpec(
         name="get_current_weather",
         description="Get current Open-Meteo model conditions, temperature, humidity and wind for a location. Never describe these as measured observations.",
