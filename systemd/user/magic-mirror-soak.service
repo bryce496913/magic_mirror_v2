@@ -1,0 +1,17 @@
+[Unit]
+Description=Magic Mirror V2 reliability soak monitor
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=exec
+WorkingDirectory=/home/bryce/magic_mirror_v2
+ExecStart=/home/bryce/magic_mirror_v2/.venv/bin/python -m magic_mirror.soak run --hours 72 --interval-seconds 300
+Restart=on-failure
+RestartSec=60s
+StandardInput=null
+UMask=0077
+SyslogIdentifier=magic-mirror-soak
+
+[Install]
+WantedBy=default.target
