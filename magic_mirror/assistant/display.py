@@ -11,7 +11,7 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .events import ConversationEvent, PlaybackAction, PlaybackEvent
+from .events import AudioTranscript, ConversationEvent, PlaybackAction, PlaybackEvent
 from .wake import WakeState
 from .tools.search import _public_url
 from .tool_visual import KINDS, ToolVisual, VERSION, VisualSource
@@ -53,13 +53,17 @@ class AssistantStateStore:
         self.assistant_item = None
         self.response_id = None
         self.playback_active = False
+        self._audio_played = False
+        self._playback_finished = False
+        self._final_from_response_done = False
         self.error = ""
         self.tool: ToolVisual | None = None
         self._retired_user_items = deque(maxlen=16)
 
     def snapshot(self) -> AssistantSnapshot:
         return AssistantSnapshot(self.state.value, self.user_text, self.user_final,
-                                 self.assistant_text, self.assistant_final,
+                                 self.assistant_text if self._audio_played else "",
+                                 self.assistant_final if self._audio_played else False,
                                  self.playback_active, self.error, self.tool)
 
     def clear_exchange(self) -> None:
@@ -68,6 +72,9 @@ class AssistantStateStore:
         self.user_item = self.assistant_item = self.response_id = None
         self.playback_active = False
         self.tool = None
+        self._audio_played = False
+        self._playback_finished = False
+        self._final_from_response_done = False
 
     def on_tool_visual(self, visual: ToolVisual | None) -> None:
         """Accept only the active turn's call; late completions cannot replace it."""
@@ -128,12 +135,31 @@ class AssistantStateStore:
             self.assistant_text = ""
             self.assistant_final = False
             self.assistant_item = None
+            self._audio_played = False
+            self._playback_finished = False
+            self._final_from_response_done = False
         elif event.kind == "response.done" and event.response_id == self.response_id:
             if event.status != "completed":
                 self.assistant_text = ""
                 self.assistant_final = False
                 self.playback_active = False
                 self.tool = None
+                self.response_id = None
+                self._audio_played = False
+                self._playback_finished = True
+            elif not self._playback_finished or self._audio_played:
+                # response.done carries the completed audio transcript even if
+                # separate streaming transcript events were absent or late.
+                for transcript in event.audio_transcripts:
+                    if (isinstance(transcript, AudioTranscript) and
+                            isinstance(transcript.item_id, str) and transcript.item_id and
+                            isinstance(transcript.text, str) and transcript.text and
+                            (self.assistant_item is None or self.assistant_item == transcript.item_id)):
+                        self.assistant_item = transcript.item_id
+                        self.assistant_text = transcript.text[:MAX_TEXT]
+                        self.assistant_final = True
+                        self._final_from_response_done = True
+                        break
         if event.text is None or not event.item_id or event.role not in {"user", "assistant"}:
             return
         if event.role == "assistant" and not event.kind.startswith("response.output_audio_transcript."):
@@ -147,6 +173,8 @@ class AssistantStateStore:
             self.user_text = (event.text if event.final else self.user_text + event.text)[:MAX_TEXT]
             self.user_final = event.final
         elif event.response_id == self.response_id:
+            if (self._playback_finished and not self._audio_played) or self._final_from_response_done:
+                return
             if self.assistant_item and self.assistant_item != event.item_id:
                 return
             self.assistant_item = event.item_id
@@ -157,19 +185,24 @@ class AssistantStateStore:
         if event.response_id != self.response_id:
             return
         if event.action == PlaybackAction.STARTED:
+            self._audio_played = True
             self.playback_active = True
         elif event.action == PlaybackAction.COMPLETED:
-            if not self.playback_active:
+            if not self._audio_played:
                 # A transcript without a successful local audio write was not spoken.
                 self.assistant_text = ""
                 self.assistant_final = False
+                self.tool = None
             self.playback_active = False
+            self._playback_finished = True
         elif event.action == PlaybackAction.INTERRUPTED:
             self.playback_active = False
             self.assistant_text = ""
             self.assistant_final = False
             self.response_id = None
             self.tool = None
+            self._audio_played = False
+            self._playback_finished = True
 
 
 def acquire_owner_lock(path: Path = SOCKET_PATH) -> int:

@@ -57,6 +57,7 @@ async def _interactive(settings: Settings) -> None:
     loop = asyncio.get_running_loop()
     registered_signals = []
     stdin_registered = False
+    keyboard_controls = sys.stdin.isatty()
     commands: set[asyncio.Task] = set()
 
     def command() -> None:
@@ -88,14 +89,16 @@ async def _interactive(settings: Settings) -> None:
         for name in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(name, controller.stop)
             registered_signals.append(name)
-        if sys.stdin.isatty():
+        if keyboard_controls:
             loop.add_reader(sys.stdin.fileno(), command)
             stdin_registered = True
+        controls = ("Press e+Enter to end a conversation, c+Enter to cancel a reply, "
+                    "or q+Enter/Ctrl+C to stop the assistant." if keyboard_controls else
+                    "Use your process supervisor or SIGTERM to stop the assistant; "
+                    "keyboard controls are unavailable without a terminal.")
         print(f"Local wake detector starting for '{settings.wake_phrase}'. "
               "After detection, wait for the listening cue before asking a question. "
-              "Say 'go to sleep' or press e+Enter to end a conversation; "
-              "c+Enter cancels a reply; "
-              "q+Enter or Ctrl+C stops the assistant.", flush=True)
+              "Say 'go to sleep' to end a conversation. " + controls, flush=True)
         await controller.run()
     finally:
         if stdin_registered:

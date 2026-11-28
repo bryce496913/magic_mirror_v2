@@ -37,14 +37,31 @@ def assistant_state():
     if not local_peer or not local_host or request.headers.get("Sec-Fetch-Site") not in {None, "none", "same-origin"}:
         abort(403)
     settings = current_app.config["MIRROR_SETTINGS"]
+    read_error = None
     if not settings.wake_enabled:
         snapshot = {"state": "disabled"}
     else:
         try:
             snapshot = read_snapshot()
-        except (OSError, ValueError, UnicodeError):
+        except (OSError, ValueError, UnicodeError) as exc:
             snapshot = {"state": "unavailable"}
+            # Local-only diagnostic; preserve the existing response body and
+            # never expose a filesystem path or exception message.
+            if isinstance(exc, FileNotFoundError):
+                read_error = "socket_missing"
+            elif isinstance(exc, PermissionError):
+                read_error = "socket_denied"
+            elif isinstance(exc, TimeoutError):
+                read_error = "socket_timeout"
+            elif isinstance(exc, ConnectionRefusedError):
+                read_error = "socket_refused"
+            elif isinstance(exc, (ValueError, UnicodeError)):
+                read_error = "invalid_snapshot"
+            else:
+                read_error = "socket_error"
     response = jsonify(snapshot)
+    if read_error is not None:
+        response.headers["X-Mirror-Assistant-Read-Status"] = read_error
     response.headers["Cache-Control"] = "no-store, private"
     response.headers["X-Content-Type-Options"] = "nosniff"
     return response

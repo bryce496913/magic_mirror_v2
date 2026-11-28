@@ -1,0 +1,19 @@
+[Unit]
+Description=Magic Mirror V2 dashboard
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+WorkingDirectory=/home/bryce/magic_mirror_v2
+ExecStart=/home/bryce/magic_mirror_v2/scripts/run_pi.sh
+Restart=on-failure
+RestartSec=15s
+TimeoutStopSec=45s
+KillSignal=SIGTERM
+KillMode=control-group
+UMask=0077
+SyslogIdentifier=magic-mirror-dashboard
+
+[Install]
+WantedBy=default.target

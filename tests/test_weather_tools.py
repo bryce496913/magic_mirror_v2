@@ -9,9 +9,9 @@ import pytest
 
 from magic_mirror.assistant.tools.weather import (
     FORECAST_URL, GEOCODE_URL, WeatherRateLimited, WeatherTools, WeatherUnavailable,
-    _fetch_json,
+    _fetch_json, _temperature,
 )
-from magic_mirror.assistant.tools.registry import default_registry
+from magic_mirror.assistant.tools.registry import ToolDispatcher, ToolStatus, default_registry
 from magic_mirror.config import Settings
 
 
@@ -70,6 +70,17 @@ def service(*, zone="America/New_York", now=None, unit="celsius", location=None)
     return weather, calls, payload, locations
 
 
+def geocoded_service(results, *, zone="America/New_York"):
+    weather, calls, payload, _ = service(zone=zone, now=instant(zone))
+
+    async def fetch(url, params):
+        calls.append((url, params))
+        return {"results": results} if url == GEOCODE_URL else payload
+
+    weather.fetch_json = fetch
+    return weather, calls, payload
+
+
 def run(coro):
     return asyncio.run(coro)
 
@@ -81,8 +92,10 @@ def test_current_conditions_default_location_and_units():
     assert result["kind"] == "current_model_estimate"
     assert (result["location"], result["timezone"], result["provider"]) == (
         "New York", "America/New_York", "Open-Meteo")
-    assert result["temperature"] == {"value": 12.0, "unit": "°C"}
-    assert result["feels_like"] == {"value": 10.0, "unit": "°C"}
+    assert result["temperature"] == {"fahrenheit": 53.6, "celsius": 12.0,
+                                     "value": 12.0, "unit": "°C"}
+    assert result["feels_like"] == {"fahrenheit": 50.0, "celsius": 10.0,
+                                    "value": 10.0, "unit": "°C"}
     assert result["humidity_percent"] == 65
     assert result["wind_speed"] == 12
     assert result["wind_direction_degrees"] == 225
@@ -91,23 +104,51 @@ def test_current_conditions_default_location_and_units():
 
     fahrenheit, calls_f, _, _ = service(unit="fahrenheit")
     result_f = run(fahrenheit.current({}))
-    assert result_f["temperature"] == {"value": 12.0, "unit": "°F"}
+    assert result_f["temperature"] == {"fahrenheit": 12.0, "celsius": -11.1,
+                                       "value": 12.0, "unit": "°F"}
+    assert result_f["feels_like"] == {"fahrenheit": 10.0, "celsius": -12.2,
+                                      "value": 10.0, "unit": "°F"}
     assert result_f["wind_unit"] == "mph"
+    assert len(calls_f) == 1
     assert calls_f[0][1]["temperature_unit"] == "fahrenheit"
 
 
-@pytest.mark.parametrize("period,expected", [
-    ("today", ["2026-11-02"]), ("tomorrow", ["2026-11-03"]),
-    ("weekend", ["2026-11-07", "2026-11-08"]),
+@pytest.mark.parametrize("value,unit,expected_f,expected_c", [
+    (20, "celsius", 68.0, 20.0),
+    (11.1, "celsius", 52.0, 11.1),
+    (0, "celsius", 32.0, 0.0),
+    (-40, "celsius", -40.0, -40.0),
+    (68, "fahrenheit", 68.0, 20.0),
+    (32, "fahrenheit", 32.0, 0.0),
+    (-4, "fahrenheit", -4.0, -20.0),
 ])
-def test_daily_forecast_periods(period, expected):
+def test_temperature_conversion_uses_source_unit_once(value, unit, expected_f, expected_c):
+    paired = _temperature(value, unit)
+    assert paired["fahrenheit"] == expected_f
+    assert paired["celsius"] == expected_c
+    assert paired["value"] == (expected_f if unit == "fahrenheit" else expected_c)
+    assert list(paired)[:2] == ["fahrenheit", "celsius"]
+
+
+@pytest.mark.parametrize("value", [None, True, float("nan"), float("inf")])
+def test_missing_or_invalid_temperature_never_gains_a_conversion(value):
+    assert _temperature(value, "celsius") is None
+
+
+@pytest.mark.parametrize("period,expected,low_f,low_c,high_f", [
+    ("today", ["2026-11-02"], 35.6, 2, 59.0),
+    ("tomorrow", ["2026-11-03"], 37.4, 3, 60.8),
+    ("weekend", ["2026-11-07", "2026-11-08"], 46.4, 8, 68.0),
+])
+def test_daily_forecast_periods(period, expected, low_f, low_c, high_f):
     weather, _, _, _ = service()
     result = run(weather.forecast({"period": period}))
     assert result["kind"] == "forecast"
     assert [day["date"] for day in result["days"]] == expected
     assert result["days"][-1]["precipitation_probability_percent"] == (20 if period == "today" else 80)
-    assert result["days"][-1]["low"] == {"value": 2 + (6 if period == "weekend" else
-                                                             1 if period == "tomorrow" else 0), "unit": "°C"}
+    assert result["days"][-1]["low"] == {"fahrenheit": low_f, "celsius": low_c,
+                                          "value": low_c, "unit": "°C"}
+    assert result["days"][0]["high"]["fahrenheit"] == high_f
 
 
 def test_hourly_afternoon_rain_and_tonight_low():
@@ -116,8 +157,23 @@ def test_hourly_afternoon_rain_and_tonight_low():
     tonight = run(weather.forecast({"period": "tonight"}))
     assert afternoon["days"] == [] and afternoon["window"]["max_precipitation_probability_percent"] == 70
     assert afternoon["window"]["from"].startswith("2026-11-02T12:00")
-    assert tonight["days"] == [] and tonight["window"]["min_temperature"] == {"value": 8.0, "unit": "°C"}
+    assert tonight["days"] == [] and tonight["window"]["min_temperature"] == {
+        "fahrenheit": 46.4, "celsius": 8.0, "value": 8.0, "unit": "°C"}
     assert tonight["window"]["until"].startswith("2026-11-03T05:00")
+
+
+def test_fahrenheit_source_pairs_forecast_high_low_and_hourly_minimum():
+    weather, calls, _, _ = service(unit="fahrenheit")
+    tomorrow = run(weather.forecast({"period": "tomorrow"}))
+    day = tomorrow["days"][0]
+    assert day["high"] == {"fahrenheit": 16.0, "celsius": -8.9,
+                           "value": 16.0, "unit": "°F"}
+    assert day["low"] == {"fahrenheit": 3.0, "celsius": -16.1,
+                          "value": 3.0, "unit": "°F"}
+    tonight = run(weather.forecast({"period": "tonight"}))
+    assert tonight["window"]["min_temperature"] == {
+        "fahrenheit": 8.0, "celsius": -13.3, "value": 8.0, "unit": "°F"}
+    assert len(calls) == 1  # forecast windows share the same cached source response
 
 
 def test_overseas_location_and_ambiguous_location():
@@ -125,6 +181,8 @@ def test_overseas_location_and_ambiguous_location():
     result = run(weather.forecast({"location": "Auckland", "period": "tomorrow"}))
     assert result["location"] == "Auckland, Auckland, New Zealand"
     assert result["timezone"] == "Pacific/Auckland"
+    assert result["days"][0]["high"]["fahrenheit"] == 60.8
+    assert result["days"][0]["high"]["celsius"] == 16.0
     assert len(calls) == 2
     assert calls[0][1]["name"] == "Auckland"
     assert calls[1][1]["latitude"] == -36.85
@@ -138,6 +196,171 @@ def test_overseas_location_and_ambiguous_location():
     assert len(ambiguous["candidates"]) == 2
     qualified = run(second.current({"location": "Auckland, NZ"}))
     assert qualified["availability"] == "available"
+
+
+@pytest.mark.parametrize("requested,geocode_name", [
+    ("New York City", "New York"),
+    ("New York", "New York"),
+    ("New York, United States", "New York"),
+    ("New York City, USA", "New York"),
+    ("NYC, NY", "New York"),
+    ("New York City, New York, United States", "New York"),
+    ("  new   york   city , U.S.A. ", "New York"),
+])
+def test_new_york_alias_preserves_geography(requested, geocode_name):
+    new_york = {"name": "New York", "admin1": "New York", "country": "United States",
+                "country_code": "US", "latitude": 40.71, "longitude": -74.01,
+                "population": 8_000_000}
+    other = {"name": "New York", "admin1": "Victoria", "country": "Australia",
+             "country_code": "AU", "latitude": -37.0, "longitude": 145.0,
+             "population": 9_000_000}
+    # A plain city name keeps the established population ranking; the alias
+    # must stay pinned even when an unrelated namesake ranks higher.
+    weather, calls, _ = geocoded_service(
+        [other, new_york] if "city" in requested.casefold() or "nyc" in requested.casefold()
+        else [new_york])
+    result = run(weather.current({"location": requested}))
+    assert result["availability"] == "available"
+    assert result["location"] == "New York, New York, United States"
+    assert calls[0][1]["name"] == geocode_name
+    assert calls[1][1]["latitude"] == 40.71
+
+
+def test_city_alias_never_selects_unrelated_country_or_region():
+    results = [{"name": "New York", "admin1": "Victoria", "country": "Australia",
+                "country_code": "AU", "latitude": -37.0, "longitude": 145.0,
+                "population": 9_000_000}]
+    weather, calls, _ = geocoded_service(results)
+    assert run(weather.current({"location": "New York City"})) == {
+        "availability": "unavailable", "reason": "location_not_found"}
+    assert run(weather.current({"location": "New York City, Australia"}))["reason"] == "location_not_found"
+    assert all(url == GEOCODE_URL for url, _ in calls)
+    namesake = {**results[0], "admin1": "Texas", "country": "United States", "country_code": "US"}
+    weather, _, _ = geocoded_service([namesake])
+    assert run(weather.current({"location": "NYC"}))["reason"] == "location_not_found"
+
+
+def test_springfield_remains_ambiguous_and_qualifiers_are_all_required():
+    results = [
+        {"name": "Springfield", "admin1": "Illinois", "country": "United States",
+         "country_code": "US", "latitude": 39.78, "longitude": -89.64, "population": 115000},
+        {"name": "Springfield", "admin1": "Massachusetts", "country": "United States",
+         "country_code": "US", "latitude": 42.10, "longitude": -72.59, "population": 154000},
+    ]
+    weather, _, _ = geocoded_service(results)
+    ambiguous = run(weather.current({"location": "Springfield"}))
+    assert ambiguous["availability"] == "ambiguous" and len(ambiguous["candidates"]) == 2
+    assert run(weather.forecast({"location": "Springfield", "period": "tomorrow"}))["availability"] == "ambiguous"
+    qualified = run(weather.current({"location": "Springfield, Illinois, USA"}))
+    assert qualified["location"] == "Springfield, Illinois, United States"
+    assert run(weather.current({"location": "Springfield, Illinois, Canada"}))["reason"] == "location_not_found"
+
+
+def test_manhattan_name_and_explicit_region_select_distinct_places():
+    manhattan_ny = {"name": "Manhattan", "admin1": "New York", "country": "United States",
+                    "country_code": "US", "latitude": 40.78, "longitude": -73.97,
+                    "population": 1_487_536}
+    manhattan_ks = {"name": "Manhattan", "admin1": "Kansas", "country": "United States",
+                    "country_code": "US", "latitude": 39.18, "longitude": -96.57,
+                    "population": 56_308}
+    weather, calls, _ = geocoded_service([manhattan_ks, manhattan_ny])
+    ny = run(weather.current({"location": "Manhattan"}))
+    assert ny["availability"] == "available"
+    assert ny["location"] == "Manhattan, New York, United States"
+    assert calls[0][1]["name"] == "Manhattan" and calls[1][1]["latitude"] == 40.78
+    kansas = run(weather.current({"location": "Manhattan, Kansas, USA"}))
+    assert kansas["availability"] == "available"
+    assert kansas["location"] == "Manhattan, Kansas, United States"
+    assert calls[-1][1]["latitude"] == 39.18
+
+
+def test_tokyo_tomorrow_forecast_and_missing_city_data():
+    tokyo = {"name": "Tokyo", "admin1": "Tokyo", "country": "Japan", "country_code": "JP",
+             "latitude": 35.68, "longitude": 139.69, "population": 13_000_000}
+    weather, calls, payload = geocoded_service([tokyo], zone="Asia/Tokyo")
+    tomorrow = run(weather.forecast({"location": "Tokyo, Japan", "period": "tomorrow"}))
+    assert tomorrow["availability"] == "available" and tomorrow["period"] == "tomorrow"
+    assert tomorrow["location"] == "Tokyo, Tokyo, Japan" and len(tomorrow["days"]) == 1
+    assert calls[0][1]["name"] == "Tokyo"
+    payload["current"] = {}
+    current = run(weather.current({"location": "Tokyo, Japan"}))
+    assert current == {"availability": "unavailable", "reason": "current_data_missing"}
+
+
+@pytest.mark.parametrize("city,region,country,latitude,longitude,zone", [
+    ("Tokyo", "Tokyo", "Japan", 35.68, 139.69, "Asia/Tokyo"),
+    ("Paris", "Île-de-France", "France", 48.85, 2.35, "Europe/Paris"),
+    ("London", "England", "United Kingdom", 51.51, -0.13, "Europe/London"),
+])
+def test_explicit_international_city_uses_its_own_label_coordinates_and_units(
+        city, region, country, latitude, longitude, zone):
+    result = {"name": city, "admin1": region, "country": country,
+              "latitude": latitude, "longitude": longitude, "population": 2_000_000}
+    weather, calls, _ = geocoded_service([result], zone=zone)
+    weather.settings = Settings(weather_latitude=40.7, weather_longitude=-74.0,
+                                weather_location_name="Dashboard default", weather_unit="fahrenheit")
+    current = run(weather.current({"location": f"{city}, {country}"}))
+    assert current["availability"] == "available"
+    assert current["location"] == f"{city}, {region}, {country}"
+    assert current["temperature"]["unit"] == "°F"
+    assert [url for url, _ in calls] == [GEOCODE_URL, FORECAST_URL]
+    assert calls[-1][1]["latitude"] == latitude and calls[-1][1]["longitude"] == longitude
+    assert calls[-1][1]["temperature_unit"] == "fahrenheit"
+
+
+def test_malformed_city_arguments_and_geocoding_results_fail_closed():
+    weather, calls, _ = geocoded_service([])
+    for location in (42, ["New York"], "New York City,, USA", "New York City, USA, extra, part"):
+        assert run(weather.current({"location": location}))["availability"] == "unavailable"
+    assert calls == []
+    assert run(weather.current({"location": "Unknown City"}))["reason"] == "location_not_found"
+    weather, _, _ = geocoded_service([])
+
+    async def malformed(_url, _params):
+        return ["unexpected"]
+
+    weather.fetch_json = malformed
+    assert run(weather.current({"location": "New York City"})) == {
+        "availability": "unavailable", "reason": "invalid_provider_data"}
+    weather, _, _ = geocoded_service([])
+
+    async def malformed_results(_url, _params):
+        return {"results": "unexpected"}
+
+    weather.fetch_json = malformed_results
+    assert run(weather.current({"location": "New York City"})) == {
+        "availability": "unavailable", "reason": "invalid_provider_data"}
+
+
+def test_unsupported_or_blank_explicit_location_never_uses_dashboard_default():
+    weather, calls, _ = geocoded_service([])
+    assert run(weather.current({"location": "Atlantis"})) == {
+        "availability": "unavailable", "reason": "location_not_found"}
+    assert run(weather.forecast({"location": "Atlantis", "period": "tomorrow"})) == {
+        "availability": "unavailable", "reason": "location_not_found"}
+    assert [url for url, _ in calls] == [GEOCODE_URL, GEOCODE_URL]
+    for location in ("", "  ", None):
+        assert run(weather.current({"location": location})) == {
+            "availability": "unavailable", "reason": "invalid_location"}
+        assert run(weather.forecast({"location": location, "period": "tomorrow"})) == {
+            "availability": "unavailable", "reason": "invalid_location"}
+    assert [url for url, _ in calls] == [GEOCODE_URL, GEOCODE_URL]
+
+    registry = default_registry(weather.settings)
+    registry.get("get_current_weather").executor.__self__.fetch_json = weather.fetch_json
+    dispatcher = ToolDispatcher(registry, weather.settings)
+    result = run(dispatcher.execute(
+        "get_current_weather", '{"location":"Atlantis"}'))
+    assert result.status == ToolStatus.SUCCESS
+    assert result.data == {"availability": "unavailable", "reason": "location_not_found"}
+    blank = run(dispatcher.execute("get_current_weather", '{"location":"  "}'))
+    assert blank.status == ToolStatus.SUCCESS
+    assert blank.data == {"availability": "unavailable", "reason": "invalid_location"}
+    assert run(dispatcher.execute("get_current_weather", '{"location":null}')).status == ToolStatus.INVALID_ARGUMENTS
+    assert "Pass the named city" in registry.get("get_current_weather").parameters["properties"]["location"]["description"]
+    absent = run(weather.current({}))
+    assert absent["availability"] == "available" and absent["location"] == "New York"
+    assert calls[-1][0] == FORECAST_URL and calls[-1][1]["latitude"] == 40.7
 
 
 def test_local_midnight_and_daylight_saving_fold():
@@ -167,9 +390,31 @@ def test_missing_forecast_fields_and_current_fields_are_not_invented():
     result = run(weather.forecast({"period": "tomorrow"}))
     assert result["days"][0]["low"] is None
     assert run(weather.current({}))["humidity_percent"] is None
+    payload["current"]["temperature_2m"] = None
+    payload["current"]["apparent_temperature"] = None
+    current = run(weather.current({}))
+    assert current["temperature"] is None and current["feels_like"] is None
     payload["daily"].pop("time")
     weather._cache.clear()
     assert run(weather.forecast({"period": "tomorrow"}))["reason"] == "forecast_data_missing"
+
+
+@pytest.mark.parametrize("unit", ["celsius", "fahrenheit"])
+def test_seven_day_paired_temperatures_fit_tool_output_limit(unit):
+    weather, calls, _, _ = service(unit=unit)
+    registry = default_registry(weather.settings)
+    spec = registry.get("get_weather_forecast")
+    registered_weather = spec.executor.__self__
+    registered_weather.fetch_json = weather.fetch_json
+    registered_weather.now = weather.now
+    result = run(ToolDispatcher(registry, weather.settings).execute(
+        "get_weather_forecast", '{"period":"next_7_days"}'))
+    assert result.status == ToolStatus.SUCCESS
+    assert len(result.json().encode("utf-8")) <= spec.max_output_bytes
+    assert len(result.data["days"]) == 7
+    assert all(set(day["high"]) >= {"fahrenheit", "celsius"} and
+               set(day["low"]) >= {"fahrenheit", "celsius"} for day in result.data["days"])
+    assert len(calls) == 1 and calls[0][0] == FORECAST_URL
 
 
 def test_cache_reuse_failure_stale_and_expiration():

@@ -1,6 +1,6 @@
 # Pass 7D Raspberry Pi display validation
 
-This PR is stacked on Pass 7C and should be installed for physical acceptance only after the project lead approves its earlier dependencies. Preserve the existing `.venv`, ignored `.env`, wake model, Pi-hole CA/password, PipeWire USB microphone, MAX98357A speaker, and GPIO BCM22/27/24 wiring. Stop the current Flask and wake processes cleanly before switching branches.
+PR #13 now targets `main` and includes the Pass 7E tool hardening previously merged into its feature branch. Preserve the existing `.venv`, ignored `.env`, wake model, Pi-hole CA/password, PipeWire USB microphone, MAX98357A speaker, and GPIO BCM22/27/24 wiring. If the user-level dashboard and voice services are active, stop them with `systemctl --user stop magic-mirror-dashboard.service magic-mirror-voice.service` before the manual commands below; this avoids competing port, microphone, and GPIO owners. Record their prior states and restore them after testing. Stop any foreground Flask and wake processes cleanly before switching branches.
 
 ```bash
 cd ~/magic_mirror_v2

@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import signal
 import threading
 import time
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ import numpy as np
 import pytest
 
 from magic_mirror.assistant.client import RealtimeError
+from magic_mirror.assistant import wake_cli
 from magic_mirror.assistant.events import (ConversationEvent, ConversationState,
                                            PlaybackAction, PlaybackEvent)
 from magic_mirror.assistant.wake import (DecimateTo16k, WakeController, WakeError,
@@ -630,3 +632,64 @@ def test_tool_loading_moves_wake_state_back_to_processing():
     assert states[-1] == WakeState.PROCESSING and visuals[-1] is event
     controller._tool_visual(None)
     assert visuals[-1] is None
+
+
+def test_noninteractive_wake_cli_handles_spoken_sleep_and_sigterm(monkeypatch, capsys):
+    """A supervised CLI needs neither keyboard input nor another audio owner."""
+    audio = FakeAudio()
+    holder = []
+    servers = []
+    handlers = {}
+
+    class FakeServer:
+        def __init__(self, _store):
+            self.closed = False
+            servers.append(self)
+
+        async def start(self):
+            pass
+
+        async def close(self):
+            self.closed = True
+
+    def controller_factory(config, **callbacks):
+        controller = WakeController(config, audio=audio,
+                                    detector_factory=lambda _: FakeDetector([True]),
+                                    voice_factory=lambda *args, **kwargs: FakeVoice(
+                                        *args, gate=asyncio.Event(), **kwargs),
+                                    process=FakeProcess(), **callbacks)
+        holder.append(controller)
+        return controller
+
+    monkeypatch.setattr(wake_cli, "AssistantStateServer", FakeServer)
+    monkeypatch.setattr(wake_cli, "WakeController", controller_factory)
+    monkeypatch.setattr(wake_cli.sys, "stdin", SimpleNamespace(
+        isatty=lambda: False, readline=lambda: pytest.fail("stdin was read")))
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(loop, "add_reader", lambda *args: pytest.fail("TTY reader installed"))
+        monkeypatch.setattr(loop, "add_signal_handler", lambda sig, callback: handlers.__setitem__(sig, callback))
+        monkeypatch.setattr(loop, "remove_signal_handler", lambda sig: handlers.pop(sig, None))
+        task = asyncio.create_task(wake_cli._interactive(settings(led_enabled=False)))
+        try:
+            await wait_until(lambda: holder and holder[0].state == WakeState.RESPONDING)
+            assert audio.capture.active and len(holder) == 1
+            holder[0]._voice_event(ConversationEvent(
+                "conversation.item.input_audio_transcription.completed", ConversationState.LISTENING,
+                role="user", item_id="user", text="Go to sleep.", final=True))
+            await wait_until(lambda: holder[0].state == WakeState.IDLE and audio.capture.starts >= 3)
+            assert not holder[0].stop_event.is_set() and signal.SIGTERM in handlers
+            handlers[signal.SIGTERM]()
+            await asyncio.wait_for(task, 2)
+        finally:
+            if not task.done():
+                holder[0].stop()
+                await task
+        assert servers[0].closed and not audio.capture.active
+
+    asyncio.run(scenario())
+    output = capsys.readouterr().out
+    assert "keyboard controls are unavailable" in output
+    assert "Wake state: wake_detected" in output
+    assert "Wake state: stopped" in output

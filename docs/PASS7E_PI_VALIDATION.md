@@ -1,14 +1,14 @@
 # Pass 7E Raspberry Pi validation
 
-This is a physical acceptance checklist, not a claim of hardware approval. Pass 7E is stacked on Pass 7D until that PR merges. Test only after the project lead approves the prerequisite passes. Use the existing Pi 4B and normal application user. Preserve `.venv`, `.env`, `.private/`, the wake model directory, Pi-hole application password/CA, PipeWire source, MAX98357A output, and BCM22/27/24 wiring. Stop existing foreground Flask and wake processes with Ctrl+C before switching branches. Do not change Pi-hole, DNS, GPIO boot settings, systemd, or Chromium autostart.
+This is a physical acceptance checklist, not a claim of hardware approval. Pass 7E hardening is included in PR #13's `pass-7d-tool-dashboard` branch. Test only after project-lead approval. Use the existing Raspberry Pi and normal application user. Preserve `.venv`, `.env`, `.private/`, the wake model directory, Pi-hole application password/CA, PipeWire source, MAX98357A output, and BCM22/27/24 wiring. Stop existing foreground Flask and wake processes with Ctrl+C before switching branches. If the user-level dashboard and voice services are active, record their states and stop them before running the manual commands below; restore their prior states afterward. Do not change Pi-hole, DNS, GPIO boot settings, systemd unit files, or Chromium autostart.
 
 1. **Install and inspect configuration.** Run the following without deleting `.venv` or copying `.env.example` over `.env`:
 
    ```bash
    cd ~/magic_mirror_v2
-   git fetch origin pass-7e-tool-hardening
-   git switch pass-7e-tool-hardening || git switch --track origin/pass-7e-tool-hardening
-   git pull --ff-only origin pass-7e-tool-hardening
+   git fetch origin pass-7d-tool-dashboard
+   git switch pass-7d-tool-dashboard || git switch --track origin/pass-7d-tool-dashboard
+   git pull --ff-only origin pass-7d-tool-dashboard
    test -f .env && test -d .private && test -x .venv/bin/python
    .venv/bin/python -m pip install -r requirements.txt -r requirements-wake.txt
    .venv/bin/python -m pip check
