@@ -33,6 +33,7 @@ tests/                  hardware-free application and configuration tests
 scripts/run_pi.sh       manual Raspberry Pi launcher
 scripts/manage_user_services.py  explicit user-service install/activate/rollback
 systemd/user/           optional dashboard and voice user units
+magic_mirror/soak.py    optional read-only reliability monitor and report CLI
 .env.example            safe local configuration example
 requirements.txt        pinned Python dependencies
 ```
@@ -172,6 +173,8 @@ The CLI also reports digital peak levels and the number of samples limited after
 For the hardware validation steps, including a private Pi-hole credential setup procedure and version check, see [Pass 3 Raspberry Pi validation](docs/PASS3_PI_VALIDATION.md).
 
 The manual Flask launcher remains available for development and rollback. Pass 7E-1 adds optional, separately supervised **user-level** dashboard and wake/voice services for the `bryce` account on the Raspberry Pi 5. Checking out the repository does not install or enable either service. In systemd mode there is no interactive stdin: spoken sleep still works, while `c`, `e`, and `q` are unavailable; control the assistant with `systemctl --user stop`, `start`, or `restart magic-mirror-voice.service`. See [Pass 7E-1 systemd installation and rollback](docs/PASS7E1_SYSTEMD_VALIDATION.md) for the explicit migration commands, boot and crash checks, audio readiness gate, and rollback. Chromium remains separately managed.
+
+Pass 8A provides an opt-in, read-only 72-hour reliability monitor for the existing user services, dashboard health, Pi-hole, PipeWire, WirePlumber, and system resources. It writes private, bounded JSONL samples and a local summary report. See [Pass 8A soak setup and removal](docs/PASS8A_SOAK_MONITORING.md). It is not activated by checkout or installation.
 
 ## Raspberry Pi display check
 
