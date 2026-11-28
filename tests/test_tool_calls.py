@@ -46,6 +46,11 @@ def sent_outputs(client):
     return [payload["item"] for payload in client.sent if payload["type"] == "conversation.item.create"]
 
 
+def visual_sources(store):
+    visual = store.snapshot().tool
+    return visual.sources if visual is not None else ()
+
+
 def test_official_function_call_events_and_mock_websocket_continuation():
     delta = {"type": "response.function_call_arguments.delta", "response_id": "r1",
              "item_id": "i1", "call_id": "c1", "output_index": 0, "delta": "{"}
@@ -580,7 +585,7 @@ def test_search_citations_wait_for_matching_spoken_audio_and_clear_on_new_turn(m
                                                 openai_api_key="fixture-only-key")
         voice.on_event = store.on_event
         voice.on_playback = store.on_playback
-        voice.on_sources = store.on_sources
+        voice.on_tool_visual = store.on_tool_visual
         task = asyncio.create_task(voice.run())
         try:
             await wait_until(lambda: audio.capture.active)
@@ -595,9 +600,10 @@ def test_search_citations_wait_for_matching_spoken_audio_and_clear_on_new_turn(m
             output = sent_outputs(client)
             assert output[0]["call_id"] == "search-id"
             assert json.loads(output[0]["output"])["data"]["sources"][0]["title"] == "Official release"
+            assert store.snapshot().tool and not store.snapshot().assistant_text
+            assert store.snapshot().tool.call_id == "search-id"
             assert [x for x in client.sent if x["type"] == "response.create"] == [
                 {"type": "response.create", "response": {"tool_choice": "none", "output_modalities": ["audio"]}}]
-            assert store.snapshot().sources and not store.snapshot().assistant_text
             assert voice.phase == VoicePhase.PROCESSING and audio.playback.starts == 0
             client.queue.put_nowait(event("response.created", response="spoken-search"))
             client.queue.put_nowait(event("response.output_audio.delta", response="spoken-search",
@@ -607,9 +613,9 @@ def test_search_citations_wait_for_matching_spoken_audio_and_clear_on_new_turn(m
             client.queue.put_nowait(event("response.done", response="spoken-search", status="completed"))
             await wait_until(lambda: audio.playback.starts == 1 and voice.phase == VoicePhase.LISTENING)
             assert store.snapshot().assistant_text == "Raspberry Pi reports a release."
-            assert store.snapshot().sources[0]["url"].startswith("https://")
+            assert store.snapshot().tool.sources[0].url.startswith("https://")
             client.queue.put_nowait(event("input_audio_buffer.speech_started", item="u2"))
-            await wait_until(lambda: store.snapshot().sources == ())
+            await wait_until(lambda: store.snapshot().tool is None)
         finally:
             voice.stop_event.set()
             await task
@@ -628,7 +634,7 @@ def test_search_citations_wait_for_matching_spoken_audio_and_clear_on_new_turn(m
     {"availability": "unavailable", "reason": "no_cited_results"},
     {"availability": "unavailable", "reason": "provider_timeout"},
 ])
-def test_search_continuation_blocks_repeat_and_reaches_spoken_answer(monkeypatch, search_result, caplog):
+def test_search_continuation_reaches_spoken_answer(monkeypatch, search_result, caplog):
     from magic_mirror.assistant.tools.search import WebSearch
 
     requests = []
@@ -646,7 +652,7 @@ def test_search_continuation_blocks_repeat_and_reaches_spoken_answer(monkeypatch
                                                 openai_api_key="fixture-only-key")
         voice.on_event = store.on_event
         voice.on_playback = store.on_playback
-        voice.on_sources = store.on_sources
+        voice.on_tool_visual = store.on_tool_visual
         task = asyncio.create_task(voice.run())
         try:
             await wait_until(lambda: audio.capture.active)
@@ -660,22 +666,15 @@ def test_search_continuation_blocks_repeat_and_reaches_spoken_answer(monkeypatch
             assert client.sent[-1] == {"type": "response.create",
                                        "response": {"tool_choice": "none", "output_modalities": ["audio"]}}
             if search_result["availability"] == "available":
-                assert store.snapshot().sources
+                assert visual_sources(store)
             else:
-                assert store.snapshot().sources == ()
+                assert visual_sources(store) == ()
 
-            # A misbehaving model may still ask again despite tool_choice=none.
-            client.queue.put_nowait(event("response.created", response="search-2"))
-            client.queue.put_nowait(tool_done("search-2", tool_call(
-                "call-2", name="search_web", arguments='{"query":"latest Pi release today"}')))
-            await wait_until(lambda: len(sent_outputs(client)) == 2)
-            assert len(requests) == 1
-            assert json.loads(sent_outputs(client)[1]["output"])["status"] == "tool_unavailable"
-            assert len([x for x in client.sent if x["type"] == "response.create"]) == 2
+            assert len([x for x in client.sent if x["type"] == "response.create"]) == 1
             assert all(x["response"]["tool_choice"] == "none" for x in client.sent
                        if x["type"] == "response.create")
             if search_result["availability"] == "available":
-                assert store.snapshot().sources
+                assert visual_sources(store)
 
             client.queue.put_nowait(event("response.created", response="spoken"))
             client.queue.put_nowait(event("response.output_audio.delta", response="spoken",
@@ -685,14 +684,13 @@ def test_search_continuation_blocks_repeat_and_reaches_spoken_answer(monkeypatch
             client.queue.put_nowait(event("response.done", response="spoken", status="completed"))
             await wait_until(lambda: audio.playback.starts == 1 and voice.phase == VoicePhase.LISTENING)
             assert store.snapshot().assistant_text == "Spoken answer."
-            assert bool(store.snapshot().sources) == (search_result["availability"] == "available")
+            assert bool(visual_sources(store)) == (search_result["availability"] == "available")
         finally:
             voice.stop_event.set()
             await asyncio.wait_for(task, 2)
 
     with caplog.at_level(logging.INFO):
         asyncio.run(asyncio.wait_for(scenario(), 5))
-    assert "search_already_attempted_this_turn" in caplog.text
     assert "Search retrieval (status=" in caplog.text
     assert "latest Pi release" not in caplog.text
 
@@ -795,14 +793,14 @@ def test_search_continuation_disconnect_releases_audio_and_clears_sources(monkey
                                                 openai_api_key="fixture-only-key")
         voice.on_event = store.on_event
         voice.on_playback = store.on_playback
-        voice.on_sources = store.on_sources
+        voice.on_tool_visual = store.on_tool_visual
         task = asyncio.create_task(voice.run())
         await wait_until(lambda: audio.capture.active)
         client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user"))
         client.queue.put_nowait(event("response.created", response="search"))
         client.queue.put_nowait(tool_done("search", tool_call(
             "call", name="search_web", arguments='{"query":"latest release"}')))
-        await wait_until(lambda: bool(store.snapshot().sources) and
+        await wait_until(lambda: bool(visual_sources(store)) and
                          any(x["type"] == "response.create" for x in client.sent))
         client.queue.put_nowait(RealtimeError("Realtime connection closed unexpectedly",
                                               category="abnormal_no_frame"))
@@ -810,7 +808,7 @@ def test_search_continuation_disconnect_releases_audio_and_clears_sources(monkey
             await asyncio.wait_for(task, 2)
         store.on_state(WakeState.ERROR)
         assert audio.closed and client.closed and not audio.capture.active
-        assert store.snapshot().sources == () and not store.snapshot().assistant_text
+        assert visual_sources(store) == () and not store.snapshot().assistant_text
 
     asyncio.run(asyncio.wait_for(scenario(), 5))
 
@@ -867,7 +865,7 @@ def test_cited_search_acknowledged_then_abnormal_socket_close(monkeypatch, caplo
         voice.client = RealtimeClient(voice.settings, connector=connector)
         voice.on_event = store.on_event
         voice.on_playback = store.on_playback
-        voice.on_sources = store.on_sources
+        voice.on_tool_visual = store.on_tool_visual
         task = asyncio.create_task(voice.run())
         await wait_until(lambda: audio.capture.active)
         for payload in (
@@ -888,9 +886,9 @@ def test_cited_search_acknowledged_then_abnormal_socket_close(monkeypatch, caplo
         assert len(outputs) == len(continuations) == 1
         assert json.loads(outputs[0]["item"]["output"])["data"]["availability"] == "available"
         assert continuations[0]["response"] == {"tool_choice": "none", "output_modalities": ["audio"]}
-        assert store.snapshot().sources and not store.snapshot().assistant_text
+        assert visual_sources(store) and not store.snapshot().assistant_text
         store.on_state(WakeState.ERROR)
-        assert store.snapshot().sources == () and audio.closed and socket.closed
+        assert visual_sources(store) == () and audio.closed and socket.closed
 
     with caplog.at_level(logging.INFO):
         asyncio.run(asyncio.wait_for(scenario(), 5))
@@ -922,7 +920,7 @@ def test_long_search_audio_burst_keeps_receiving_while_speaker_is_slow(monkeypat
                                                 openai_api_key="fixture-only-key")
         voice.on_event = store.on_event
         voice.on_playback = store.on_playback
-        voice.on_sources = store.on_sources
+        voice.on_tool_visual = store.on_tool_visual
         release = threading.Event()
         original_write = audio.playback.write
 
@@ -965,7 +963,7 @@ def test_long_search_audio_burst_keeps_receiving_while_speaker_is_slow(monkeypat
             assert voice._audio_received_samples == 200 * 2400
             assert 8 < voice._output_queue_peak <= voice._output.maxsize
             assert ticks > 20  # receive work yielded to keepalive and playback tasks
-            assert store.snapshot().sources and not store.snapshot().assistant_text
+            assert visual_sources(store) and not store.snapshot().assistant_text
             # The speaker is still gated. The completion marker must remain
             # behind every received audio chunk, regardless of Pi thread speed.
             await wait_until(lambda: audio.playback.starts == 1)
@@ -1020,7 +1018,7 @@ def test_search_playback_drains_in_order_before_returning_to_listening(monkeypat
         audio.playback.write = gated_write
         voice.on_event = store.on_event
         voice.on_playback = on_playback
-        voice.on_sources = store.on_sources
+        voice.on_tool_visual = store.on_tool_visual
         task = asyncio.create_task(voice.run())
         try:
             await wait_until(lambda: audio.capture.active)
@@ -1044,7 +1042,7 @@ def test_search_playback_drains_in_order_before_returning_to_listening(monkeypat
             assert len(written) == 3 and written == sorted(written) and len(set(written)) == 3
             assert voice.phase == VoicePhase.LISTENING
             assert store.snapshot().assistant_text == "Official spoken answer."
-            assert store.snapshot().sources
+            assert visual_sources(store)
         finally:
             release.set()
             voice.stop_event.set()
@@ -1118,7 +1116,7 @@ def test_cited_search_continuation_without_spoken_audio_recovers(monkeypatch, ca
                                                 openai_api_key="fixture-only-key")
         voice.on_event = store.on_event
         voice.on_playback = store.on_playback
-        voice.on_sources = store.on_sources
+        voice.on_tool_visual = store.on_tool_visual
         task = asyncio.create_task(voice.run())
         await wait_until(lambda: audio.capture.active)
         client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user"))
@@ -1136,9 +1134,9 @@ def test_cited_search_continuation_without_spoken_audio_recovers(monkeypatch, ca
         with pytest.raises(VoiceError):
             await asyncio.wait_for(task, 2)
         if outcome == "text_only":
-            assert store.snapshot().sources == ()
+            assert visual_sources(store) == ()
         store.on_state(WakeState.ERROR)
-        assert audio.closed and client.closed and store.snapshot().sources == ()
+        assert audio.closed and client.closed and visual_sources(store) == ()
         assert not store.snapshot().assistant_text
 
     with caplog.at_level(logging.INFO):
@@ -1171,8 +1169,8 @@ def test_search_never_runs_without_function_call_and_late_result_is_discarded(mo
         monkeypatch.setattr(WebSearch, "search", slow)
         voice, audio, client, _, _ = make_voice(tools_enabled=True, search_enabled=True,
                                                 openai_api_key="fixture-only-key")
-        seen_sources = []
-        voice.on_sources = seen_sources.append
+        seen_visual = []
+        voice.on_tool_visual = seen_visual.append
         task = asyncio.create_task(voice.run())
         await wait_until(lambda: audio.capture.active)
         client.queue.put_nowait(event("input_audio_buffer.speech_started", item="stable"))
@@ -1192,9 +1190,65 @@ def test_search_never_runs_without_function_call_and_late_result_is_discarded(mo
         voice.stop_event.set()
         release.set()
         await task
-        assert calls == [1] and not seen_sources
+        assert calls == [1] and not any(item is not None and item.status == "completed"
+                                        for item in seen_visual)
         assert not any(item["call_id"] == "late-call" for item in sent_outputs(client))
         assert audio.closed and client.closed
+
+    asyncio.run(scenario())
+
+
+def test_weather_tool_visual_tracks_actual_call_and_speech(monkeypatch):
+    from magic_mirror.assistant.display import AssistantStateStore
+    from magic_mirror.assistant.tools.weather import WeatherTools
+    from magic_mirror.assistant.wake import WakeState
+
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def current(_self, _arguments):
+            entered.set()
+            await release.wait()
+            return {"availability": "available", "location": "Auckland",
+                    "conditions": "Rain", "temperature": {"value": 11, "unit": "°C"},
+                    "freshness": "fresh", "precipitation_probability_percent": 70}
+
+        monkeypatch.setattr(WeatherTools, "current", current)
+        store = AssistantStateStore()
+        store.on_state(WakeState.LISTENING)
+        voice, audio, client, _, _ = make_voice(tools_enabled=True)
+        voice.on_event = store.on_event
+        voice.on_playback = store.on_playback
+        voice.on_tool_visual = store.on_tool_visual
+        task = asyncio.create_task(voice.run())
+        try:
+            await wait_until(lambda: audio.capture.active)
+            client.queue.put_nowait(event("input_audio_buffer.speech_started", item="u1"))
+            client.queue.put_nowait(event("input_audio_buffer.speech_stopped", item="u1"))
+            client.queue.put_nowait(event("response.created", response="tool-r"))
+            call = tool_call("weather-call", name="get_current_weather",
+                             arguments='{"location":"Auckland"}', item_id="tool-item")
+            client.queue.put_nowait(tool_done("tool-r", call))
+            await entered.wait()
+            snap = store.snapshot()
+            assert snap.tool.status == "loading" and snap.tool.turn_id == "u1"
+            assert snap.tool.call_id == "weather-call" and snap.tool.response_id == "tool-r"
+            release.set()
+            await wait_until(lambda: store.snapshot().tool is not None and
+                             store.snapshot().tool.status == "completed")
+            assert "Auckland" in store.snapshot().tool.title
+            assert "11°C" in store.snapshot().tool.summary
+            client.queue.put_nowait(event("response.created", response="spoken-r"))
+            client.queue.put_nowait(event("response.output_audio.delta", response="spoken-r",
+                                          item="audio", audio=pcm_audio()))
+            client.queue.put_nowait(event("response.done", response="spoken-r", status="completed"))
+            await wait_until(lambda: audio.playback.starts == 1 and voice.phase == VoicePhase.LISTENING)
+            client.queue.put_nowait(event("input_audio_buffer.speech_started", item="u2"))
+            await wait_until(lambda: store.snapshot().tool is None)
+        finally:
+            release.set()
+            voice.stop_event.set()
+            await task
 
     asyncio.run(scenario())
 
@@ -1516,6 +1570,36 @@ def test_timeout_provider_failure_output_budget_and_no_secret_logging(caplog):
     assert "RuntimeError" in caplog.text and secret not in caplog.text
 
 
+def test_tool_metrics_are_bounded_counters_without_arguments_or_results():
+    async def success(arguments):
+        return {"word": arguments["word"]}
+
+    async def scenario():
+        dispatcher = ToolDispatcher(tool_registry(success), Settings(tools_enabled=True))
+        assert (await dispatcher.execute("safe_echo", '{"word":"private text"}')).status == ToolStatus.SUCCESS
+        assert (await dispatcher.execute("missing", "{}")).status == ToolStatus.TOOL_UNAVAILABLE
+        assert (await dispatcher.execute("safe_echo", '{"word":"too long to be accepted"}')).status == ToolStatus.INVALID_ARGUMENTS
+        metrics = dispatcher.metrics()
+        assert (metrics.invocations, metrics.successes, metrics.failures, metrics.cancellations) == (3, 1, 2, 0)
+        assert metrics.total_latency_ms >= metrics.max_latency_ms >= 0
+        assert "private text" not in repr(metrics)
+
+    asyncio.run(scenario())
+
+
+def test_web_result_cannot_request_another_tool_in_same_turn():
+    async def scenario():
+        voice, _, _, _, _ = make_voice(tools_enabled=True, search_enabled=True,
+                                      openai_api_key="fixture-only-key")
+        voice._turn_pending = True
+        voice._search_used_this_turn = True
+        with pytest.raises(VoiceError, match="web search continuation"):
+            await voice._start_tool_calls(tool_done("next", tool_call("next-call")))
+        assert voice.tool_dispatcher.metrics().invocations == 0
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("failure,expected", [("timeout", "timeout"),
                                              ("exception", "provider_failure")])
 def test_realtime_tool_failure_returns_status_then_continues(failure, expected):
@@ -1563,14 +1647,48 @@ def test_cancel_during_tool_execution_drops_late_result_and_restores_listening()
         client.queue.put_nowait(tool_done("r1", tool_call("c1", name="safe_echo",
                                                        arguments='{"word":"ok"}')))
         await asyncio.wait_for(started.wait(), 1)
-        await asyncio.wait_for(voice.cancel_reply(), 0.3)
-        assert voice.phase == VoicePhase.LISTENING and not sent_outputs(client)
+        cancellation = asyncio.create_task(voice.cancel_reply())
+        await asyncio.sleep(0.01)
         release.set()
+        await asyncio.wait_for(cancellation, 0.3)
+        assert voice.phase == VoicePhase.LISTENING and not sent_outputs(client)
         await asyncio.sleep(0.02)
         assert not any(x["type"] == "response.create" for x in client.sent)
         voice.stop_event.set()
         await task
         assert audio.closed and client.closed
+    asyncio.run(scenario())
+
+
+def test_noncooperative_tool_cancellation_closes_session_without_new_turn():
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def executor(_):
+            started.set()
+            while not release.is_set():
+                try:
+                    await asyncio.wait_for(release.wait(), 0.01)
+                except (asyncio.CancelledError, TimeoutError):
+                    continue  # emulate a provider that ignores cancellation
+            return {"word": "late"}
+
+        voice, audio, client, _, _ = make_voice(tools_enabled=True, tool_timeout_seconds=0.1,
+                                                tool_registry=tool_registry(executor, timeout=1))
+        task = asyncio.create_task(voice.run())
+        await wait_until(lambda: audio.capture.active)
+        client.queue.put_nowait(event("input_audio_buffer.speech_started", item="user"))
+        client.queue.put_nowait(event("response.created", response="r1"))
+        client.queue.put_nowait(tool_done("r1", tool_call("c1", name="safe_echo",
+                                                       arguments='{"word":"ok"}')))
+        await asyncio.wait_for(started.wait(), 1)
+        await asyncio.wait_for(voice.cancel_reply(), 0.5)
+        assert voice.stop_event.is_set()
+        assert voice._tool_task is not None
+        release.set()
+        await asyncio.wait_for(task, 1)
+        assert not sent_outputs(client) and audio.closed and client.closed
+
     asyncio.run(scenario())
 
 

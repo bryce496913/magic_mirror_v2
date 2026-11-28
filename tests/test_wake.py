@@ -103,7 +103,7 @@ class FakeProcess:
 
 class FakeVoice:
     def __init__(self, settings, *, audio, before_capture, first_speech_seconds,
-                 on_event, on_ready, on_playback=None, on_sources=None,
+                 on_event, on_ready, on_playback=None, on_tool_visual=None,
                  gate=None, failure=None, heard_speech=True):
         self.audio = audio
         self.before_capture = before_capture
@@ -617,6 +617,21 @@ def test_wake_config_and_cli_default(tmp_path, capsys):
             Settings.from_env(values)
     assert cli_main([]) == 0
     assert "Offline" in capsys.readouterr().out
+
+
+def test_tool_loading_moves_wake_state_back_to_processing():
+    from magic_mirror.assistant.tool_visual import loading
+
+    states, visuals = [], []
+    controller = WakeController(settings(), audio=FakeAudio(),
+                                on_state=states.append, on_tool_visual=visuals.append)
+    controller._state(WakeState.RESPONDING)
+    event = loading("search_web", "user", "call", "response")
+    controller._tool_visual(event)
+    assert controller.state == WakeState.PROCESSING
+    assert states[-1] == WakeState.PROCESSING and visuals[-1] is event
+    controller._tool_visual(None)
+    assert visuals[-1] is None
 
 
 def test_noninteractive_wake_cli_handles_spoken_sleep_and_sigterm(monkeypatch, capsys):

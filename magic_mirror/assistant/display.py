@@ -14,11 +14,12 @@ from pathlib import Path
 from .events import AudioTranscript, ConversationEvent, PlaybackAction, PlaybackEvent
 from .wake import WakeState
 from .tools.search import _public_url
+from .tool_visual import KINDS, ToolVisual, VERSION, VisualSource
 
 SOCKET_PATH = Path(__file__).resolve().parents[2] / ".private" / "assistant-state.sock"
 MAX_TEXT = 240
-MAX_SNAPSHOT_BYTES = 8192
 CLIENT_IO_TIMEOUT = 0.5
+MAX_SNAPSHOT_BYTES = 8192
 CLIENT_DISCONNECT_ERRNOS = {errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED, errno.ENOTCONN}
 
 
@@ -36,7 +37,7 @@ class AssistantSnapshot:
     assistant_final: bool = False
     playback: bool = False
     error: str = ""
-    sources: tuple[dict[str, str], ...] = ()
+    tool: ToolVisual | None = None
 
 
 class AssistantStateStore:
@@ -56,37 +57,60 @@ class AssistantStateStore:
         self._playback_finished = False
         self._final_from_response_done = False
         self.error = ""
-        self.sources: tuple[dict[str, str], ...] = ()
+        self.tool: ToolVisual | None = None
         self._retired_user_items = deque(maxlen=16)
 
     def snapshot(self) -> AssistantSnapshot:
         return AssistantSnapshot(self.state.value, self.user_text, self.user_final,
                                  self.assistant_text if self._audio_played else "",
                                  self.assistant_final if self._audio_played else False,
-                                 self.playback_active, self.error,
-                                 tuple(dict(source) for source in self.sources))
+                                 self.playback_active, self.error, self.tool)
 
     def clear_exchange(self) -> None:
         self.user_text = self.assistant_text = ""
         self.user_final = self.assistant_final = False
         self.user_item = self.assistant_item = self.response_id = None
         self.playback_active = False
-        self.sources = ()
+        self.tool = None
         self._audio_played = False
         self._playback_finished = False
         self._final_from_response_done = False
 
-    def on_sources(self, sources: tuple[dict[str, str], ...]) -> None:
-        """Publish cited links for this exchange only; no raw search text is stored."""
-        accepted = []
-        for item in sources[:3]:
-            if not isinstance(item, dict):
-                continue
-            url = _public_url(item.get("url"))
-            title = item.get("title")
-            if url and isinstance(title, str) and title.strip():
-                accepted.append({"title": title.strip()[:80], "url": url})
-        self.sources = tuple(accepted)
+    def on_tool_visual(self, visual: ToolVisual | None) -> None:
+        """Accept only the active turn's call; late completions cannot replace it."""
+        if visual is None:
+            self.tool = None
+            return
+        if (not isinstance(visual, ToolVisual) or visual.version != VERSION or
+                visual.kind not in KINDS.values() or
+                visual.status not in {"loading", "completed", "unavailable"} or
+                not self.user_item or visual.turn_id != self.user_item or
+                not all(isinstance(value, str) for value in (
+                    visual.turn_id, visual.call_id, visual.response_id, visual.title,
+                    visual.summary, visual.detail, visual.freshness)) or
+                not visual.call_id or not visual.response_id or
+                len(visual.call_id) > 128 or len(visual.response_id) > 128 or
+                len(visual.title) > 80 or len(visual.summary) > 200 or
+                len(visual.detail) > 100 or len(visual.sources) > 3 or
+                any(not isinstance(source, VisualSource) or not isinstance(source.url, str) or
+                    _public_url(source.url) != source.url
+                    for source in visual.sources)):
+            return
+        try:
+            size = len(json.dumps(asdict(visual), ensure_ascii=True).encode())
+        except (TypeError, ValueError, UnicodeError):
+            return
+        if size > 2200:
+            return
+        if visual.status == "loading":
+            if visual.response_id != self.response_id:
+                return
+        elif (self.tool is None or self.tool.status != "loading" or
+              self.tool.turn_id != visual.turn_id or self.tool.call_id != visual.call_id or
+              self.tool.response_id != visual.response_id or
+              visual.response_id != self.response_id):
+            return
+        self.tool = visual
 
     def on_state(self, state: WakeState) -> None:
         self.state = state
@@ -119,7 +143,7 @@ class AssistantStateStore:
                 self.assistant_text = ""
                 self.assistant_final = False
                 self.playback_active = False
-                self.sources = ()
+                self.tool = None
                 self.response_id = None
                 self._audio_played = False
                 self._playback_finished = True
@@ -168,7 +192,7 @@ class AssistantStateStore:
                 # A transcript without a successful local audio write was not spoken.
                 self.assistant_text = ""
                 self.assistant_final = False
-                self.sources = ()
+                self.tool = None
             self.playback_active = False
             self._playback_finished = True
         elif event.action == PlaybackAction.INTERRUPTED:
@@ -176,7 +200,7 @@ class AssistantStateStore:
             self.assistant_text = ""
             self.assistant_final = False
             self.response_id = None
-            self.sources = ()
+            self.tool = None
             self._audio_played = False
             self._playback_finished = True
 

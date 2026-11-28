@@ -73,7 +73,7 @@ def _id(value: Any) -> str | None:
 
 
 def _error_code(value: Any) -> str | None:
-    """Only symbolic provider codes may reach diagnostics or CLI errors."""
+    """Accept only short symbolic codes in errors that may reach logs or CLI."""
     if value is None:
         return None
     return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value) else "unrecognized_error"
